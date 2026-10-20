@@ -1,6 +1,6 @@
 ﻿# BaselineProbe —— PCL 2.13.1.1 「内存优化」原理验证探针
 
-C# / .NET 8 控制台程序，用于独立验证 PCL 2.13.1.1 `MemoryOptimizeInternal` 的实现：
+C# / .NET 8 控制台程序，用于独立复现并验证 PCL 2.13.1.1「内存优化」的可观察行为（仅行为参考，未复制其代码）：
 `SeProfileSingleProcessPrivilege` 启用 + `NtSetSystemInformation(SystemMemoryListInformation=80, &command, 4)`，
 command 依次为 `2`（EmptyWorkingSets）→ `3`（FlushModifiedList）→ `4`（PurgeStandbyList）；
 以及非管理员时 `--memory` runas 子进程的退出码协议（退出码 = 释放的 KB）。
