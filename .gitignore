@@ -1,0 +1,31 @@
+# Rust / Cargo
+/target/
+**/target/
+**/bin/
+**/obj/
+*.pdb
+*.exp
+*.lib
+*.ilk
+*.obj
+*.rlib
+*.rmeta
+
+# 构建产物（二进制通过 GitHub Releases 分发）
+/dist/
+MemCleaner.exe
+
+# 本地测试数据与日志
+/testdata/
+*.log
+*.tmp
+
+# IDE / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 本地环境
+.env
