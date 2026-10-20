@@ -1,5 +1,9 @@
 # MemCleaner 使用说明
 
+- 开源仓库：https://github.com/Alerthater/MemCleaner
+- 下载与更新：https://github.com/Alerthater/MemCleaner/releases
+- 许可：MIT License（代码）；来源声明与第三方致谢见仓库 `NOTICE.md`；隐私/安全政策见 `PRIVACY.md` / `SECURITY.md`。
+
 一个极简、超低占用的 Windows 内存清理工具。清理能力与 PCL 启动器的「内存优化」完全一致，
 界面为 Windows 11 / macOS 风格的无边框自绘窗口。
 
