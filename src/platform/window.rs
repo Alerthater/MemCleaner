@@ -80,7 +80,7 @@ pub fn register_class(wndproc: WNDPROC) -> bool {
 }
 
 /// 创建主窗口（隐藏状态创建，随后由 app 决定显示时机）。失败返回 None。
-pub fn create_main_window(wndproc: WNDPROC, dpi: u32) -> Option<HWND> {
+pub fn create_main_window(_wndproc: WNDPROC, dpi: u32) -> Option<HWND> {
     unsafe {
         let hinstance = GetModuleHandleW(std::ptr::null());
         let class_name = wide(CLASS_NAME);
@@ -227,5 +227,55 @@ pub fn is_cursor_on_window(hwnd: HWND) -> bool {
         }
         let hit = WindowFromPoint(pt);
         hit == hwnd
+    }
+}
+
+
+/// 设置整个窗口的不透明度（50–100，使用分层窗口 LWA_ALPHA）。
+/// 100 表示完全不透明并移除 WS_EX_LAYERED。
+pub fn set_window_opacity(hwnd: HWND, percent: u8) {
+    use windows_sys::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA,
+        WS_EX_LAYERED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOSIZE,
+    };
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let want_layered = percent < 100;
+        let new_ex = if want_layered {
+            ex | WS_EX_LAYERED
+        } else {
+            ex & !WS_EX_LAYERED
+        };
+        if new_ex != ex {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
+        }
+        if want_layered {
+            let alpha = ((percent.clamp(50, 100) as u32 * 255 + 50) / 100) as u8;
+            let _ = SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+        }
+        // 让 DWM 重新合成，避免残影
+        let _ = SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        // 分层窗口会丢失 DWM 圆角，用窗口区域补一个圆角（系统接管 region 所有权）。
+        if want_layered {
+            let (cw, ch) = client_size(hwnd);
+            if cw > 0 && ch > 0 {
+                let radius = scale(14, window_dpi(hwnd)) * 2;
+                let rgn = CreateRoundRectRgn(0, 0, cw + 1, ch + 1, radius, radius);
+                if !rgn.is_null() {
+                    let _ = SetWindowRgn(hwnd, rgn, 1);
+                }
+            }
+        } else {
+            let _ = SetWindowRgn(hwnd, std::ptr::null_mut(), 1);
+        }
     }
 }

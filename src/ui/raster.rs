@@ -210,6 +210,30 @@ impl Canvas {
         }
     }
 
+    /// 把同尺寸的 ARGB 图像按整体透明度叠加到画布（用于自定义皮肤背景）。
+    /// `src` 每个像素格式 0xAARRGGBB（直通 alpha，来自 GDI+ 解码）。
+    pub fn blit_overlay_argb(&mut self, src: &[u32], alpha: f32) {
+        let a = alpha.clamp(0.0, 1.0);
+        if a <= 0.0 || self.px.is_null() {
+            return;
+        }
+        let n = (self.w.max(0) * self.h.max(0)) as usize;
+        let count = n.min(src.len());
+        unsafe {
+            for i in 0..count {
+                let s = *src.get_unchecked(i);
+                let sa = ((s >> 24) & 0xFF) as f32 / 255.0;
+                let cov = (sa * a * 255.0).round() as u32;
+                if cov == 0 {
+                    continue;
+                }
+                let p = self.px.add(i);
+                let (sr, sg, sb) = packed_rgb(s);
+                *p = mix(*p, sr, sg, sb, cov);
+            }
+        }
+    }
+
     /// 纯色矩形（f32 边界，边缘按覆盖面积抗锯齿）。
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Color) {
         let pk = c.packed();

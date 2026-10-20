@@ -51,6 +51,15 @@
 MemCleaner 采用更直接的方案：普通权限下由 UI 弹应用内确认框，确认后整体以管理员身份重启并
 立即清理；同时提供「最高权限计划任务」实现开机静默启动与自动清理（免每次 UAC）。
 
+
+### 3.4 进阶清理项与所需特权（v1.1.0 补充）
+
+- `SetSystemFileCacheSize(-1, -1, 0)`（收缩系统文件缓存，Mem Reduct 同类功能）需要
+  **`SeIncreaseQuotaPrivilege`**；v1.0.0 缺少启用步骤导致整次清理失败，v1.1.0 在调用前显式启用，
+  管理员实测返回成功（`TrimFileCache` 步骤 `STATUS_SUCCESS`）。
+- `MemoryPurgeLowPriorityStandbyList`（命令 5）需要 `SeProfileSingleProcessPrivilege`，
+  管理员权限下实测成功；PCL 未使用该命令，属 MemCleaner 的进阶可选项。
+
 ### 3.3 测量陷阱
 
 - **可用内存包含待机缓存**：`ullAvailPhys` 把 standby 页算作可用，所以只清除待机列表时可用内存

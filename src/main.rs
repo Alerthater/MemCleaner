@@ -151,6 +151,7 @@ fn print_help() {
     println!("  --elevated         以管理员身份重启（内部使用）");
     println!("  --apply-autostart  启动后应用开机自启设置（内部使用）");
     println!("  --self-test [--out 文件]  命令行自检（验证清理效果，写 JSON 结果）");
+    println!("  --self-test --with-file-cache  自检时附加「收缩文件缓存」项（需管理员，验证用）");
     println!("  --install-autostart       安装开机自启计划任务（需管理员）");
     println!("  --uninstall-autostart     卸载开机自启计划任务（需管理员）");
     println!("  --version          显示版本");

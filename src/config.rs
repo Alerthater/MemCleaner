@@ -23,6 +23,114 @@ impl Default for ThemeMode {
     }
 }
 
+/// 强调色配色方案。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AccentScheme {
+    /// 极光蓝（默认）。
+    Blue,
+    /// 薄荷绿。
+    Mint,
+    /// 紫罗兰。
+    Violet,
+    /// 琥珀橙。
+    Amber,
+    /// 樱粉。
+    Rose,
+    /// 石墨灰。
+    Graphite,
+}
+
+impl Default for AccentScheme {
+    fn default() -> Self {
+        AccentScheme::Blue
+    }
+}
+
+impl AccentScheme {
+    /// 设置页展示名。
+    pub fn display_name(self) -> &'static str {
+        match self {
+            AccentScheme::Blue => "极光蓝",
+            AccentScheme::Mint => "薄荷绿",
+            AccentScheme::Violet => "紫罗兰",
+            AccentScheme::Amber => "琥珀橙",
+            AccentScheme::Rose => "樱粉",
+            AccentScheme::Graphite => "石墨灰",
+        }
+    }
+
+    /// 设置页循环切换的下一个方案。
+    pub fn next(self) -> Self {
+        match self {
+            AccentScheme::Blue => AccentScheme::Mint,
+            AccentScheme::Mint => AccentScheme::Violet,
+            AccentScheme::Violet => AccentScheme::Amber,
+            AccentScheme::Amber => AccentScheme::Rose,
+            AccentScheme::Rose => AccentScheme::Graphite,
+            AccentScheme::Graphite => AccentScheme::Blue,
+        }
+    }
+
+    pub const ALL: [AccentScheme; 6] = [
+        AccentScheme::Blue,
+        AccentScheme::Mint,
+        AccentScheme::Violet,
+        AccentScheme::Amber,
+        AccentScheme::Rose,
+        AccentScheme::Graphite,
+    ];
+}
+
+/// 背景皮肤（预设）或自定义图片。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SkinPreset {
+    /// 默认（仿 Mica 渐变 + 光晕）。
+    Default,
+    /// 极光。
+    Aurora,
+    /// 星云。
+    Nebula,
+    /// 晨雾。
+    Dawn,
+    /// 暮色。
+    Dusk,
+    /// 自定义图片（`skin_image` 非空时生效，否则回退默认）。
+    Custom,
+}
+
+impl Default for SkinPreset {
+    fn default() -> Self {
+        SkinPreset::Default
+    }
+}
+
+impl SkinPreset {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            SkinPreset::Default => "默认",
+            SkinPreset::Aurora => "极光",
+            SkinPreset::Nebula => "星云",
+            SkinPreset::Dawn => "晨雾",
+            SkinPreset::Dusk => "暮色",
+            SkinPreset::Custom => "自定义图片",
+        }
+    }
+
+    /// 在预设之间循环（不进入 Custom；Custom 由选择图片/清除图片控制）。
+    pub fn next(self) -> Self {
+        match self {
+            SkinPreset::Default => SkinPreset::Aurora,
+            SkinPreset::Aurora => SkinPreset::Nebula,
+            SkinPreset::Nebula => SkinPreset::Dawn,
+            SkinPreset::Dawn => SkinPreset::Dusk,
+            SkinPreset::Dusk => SkinPreset::Default,
+            SkinPreset::Custom => SkinPreset::Default,
+        }
+    }
+}
+
 /// 应用配置（全部字段带默认值，旧版本配置缺字段也能读）。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -30,7 +138,7 @@ pub struct Config {
     // ---------- 自动清理 ----------
     /// 是否启用自动清理（需要管理员权限）。
     pub auto_clean_enabled: bool,
-    /// 内存使用率高于该百分比时自动清理；0 表示不按阈值触发。
+    /// 内存使用率高于该百分比时自动清理（30–100）。
     pub auto_threshold_percent: u8,
     /// 固定间隔自动清理（分钟）；0 表示关闭。
     pub auto_interval_minutes: u32,
@@ -51,6 +159,20 @@ pub struct Config {
 
     // ---------- 界面 ----------
     pub theme: ThemeMode,
+    /// 强调色配色方案。
+    pub accent: AccentScheme,
+    /// 背景皮肤预设；`Custom` 时使用 `skin_image`。
+    pub skin_preset: SkinPreset,
+    /// 自定义皮肤图片路径（空 = 未选择）。
+    pub skin_image: String,
+    /// 自定义皮肤图片叠加不透明度（0–100）。
+    pub skin_opacity: u8,
+    /// 卡片/面板不透明度（0–100）。
+    pub panel_opacity: u8,
+    /// 整个窗口的不透明度（50–100，分层窗口 alpha）。
+    pub window_opacity: u8,
+    /// 托盘图标是否直接显示内存占用率。
+    pub tray_show_percent: bool,
     /// 关闭窗口时最小化到托盘而不是退出。
     pub minimize_to_tray: bool,
     /// 是否播放动画（低性能设备可关闭）。
@@ -82,6 +204,13 @@ impl Default for Config {
             clean_low_priority: false,
             trim_file_cache: false,
             theme: ThemeMode::System,
+            accent: AccentScheme::Blue,
+            skin_preset: SkinPreset::Default,
+            skin_image: String::new(),
+            skin_opacity: 55,
+            panel_opacity: 100,
+            window_opacity: 100,
+            tray_show_percent: true,
             minimize_to_tray: true,
             animations: true,
             start_with_windows: false,
@@ -93,14 +222,11 @@ impl Default for Config {
 }
 
 impl Config {
-    /// 范围校验：把越界/不合理的值钳制或回退默认值（QA Bug-02）。
+    /// 范围校验：把越界/不合理的值钳制或回退默认值。
     /// 在 load() 解析后、save() 写入前都调用一次，保证配置文件永远合法。
     pub fn sanitize(&mut self) {
-        // 阈值：允许 0（关闭阈值触发）或 50..=100，其它一律回退 85。
-        self.auto_threshold_percent = match self.auto_threshold_percent {
-            0 | 50..=100 => self.auto_threshold_percent,
-            _ => 85,
-        };
+        // 阈值：30–100（直接输入/滑块都限制在该范围）。
+        self.auto_threshold_percent = self.auto_threshold_percent.clamp(30, 100);
         // 固定间隔：0..=1440 分钟（一天），越界回退 0（关闭）。
         if self.auto_interval_minutes > 1440 {
             self.auto_interval_minutes = 0;
@@ -108,6 +234,14 @@ impl Config {
         // 冷却时间：10..=3600 秒，越界回退 60。
         if !(10..=3600).contains(&self.auto_cooldown_seconds) {
             self.auto_cooldown_seconds = 60;
+        }
+        // 透明度范围（面板下限 20，避免把界面调到看不见）。
+        self.skin_opacity = self.skin_opacity.min(100);
+        self.panel_opacity = self.panel_opacity.clamp(20, 100);
+        self.window_opacity = self.window_opacity.clamp(50, 100);
+        // 自定义皮肤必须有图片路径，否则回退默认皮肤。
+        if self.skin_preset == SkinPreset::Custom && self.skin_image.trim().is_empty() {
+            self.skin_preset = SkinPreset::Default;
         }
         // 历史字段做上限保护，避免异常大数影响格式化。
         if self.last_freed_bytes > 1 << 50 {
@@ -128,6 +262,14 @@ impl Config {
             || self.clean_standby
             || self.clean_low_priority
             || self.trim_file_cache
+    }
+
+    /// 自定义皮肤文件名（仅用于界面展示）。
+    pub fn skin_file_name(&self) -> String {
+        std::path::Path::new(&self.skin_image)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
     }
 
     /// 把上一次清理结果写入历史字段。
@@ -158,7 +300,9 @@ fn config_path() -> PathBuf {
 /// 读取配置；文件不存在或内容损坏时返回默认配置（绝不让配置问题阻塞启动）。
 pub fn load() -> Config {
     let mut cfg = match fs::read_to_string(config_path()) {
-        Ok(text) => serde_json::from_str::<Config>(&text).unwrap_or_default(),
+        // 兼容 Windows 记事本/PowerShell 写入的 UTF-8 BOM，避免解析失败导致配置丢失。
+        Ok(text) => serde_json::from_str::<Config>(text.trim_start_matches('\u{feff}'))
+            .unwrap_or_default(),
         Err(_) => Config::default(),
     };
     cfg.sanitize();
@@ -197,6 +341,9 @@ mod tests {
         assert!(!cfg.auto_clean_enabled);
         assert_eq!(cfg.clean_working_sets, true);
         assert_eq!(cfg.auto_threshold_percent, 85);
+        assert_eq!(cfg.accent, AccentScheme::Blue);
+        assert_eq!(cfg.skin_preset, SkinPreset::Default);
+        assert!(cfg.tray_show_percent);
     }
 
     #[test]
@@ -206,20 +353,51 @@ mod tests {
         cfg.auto_interval_minutes = 99999;
         cfg.auto_cooldown_seconds = 0;
         cfg.last_freed_bytes = u64::MAX;
+        cfg.skin_opacity = 200;
+        cfg.panel_opacity = 200;
+        cfg.window_opacity = 5;
+        cfg.skin_preset = SkinPreset::Custom;
+        cfg.skin_image.clear();
         cfg.sanitize();
-        assert_eq!(cfg.auto_threshold_percent, 85);
+        assert_eq!(cfg.auto_threshold_percent, 100);
         assert_eq!(cfg.auto_interval_minutes, 0);
         assert_eq!(cfg.auto_cooldown_seconds, 60);
         assert_eq!(cfg.last_freed_bytes, 0);
+        assert_eq!(cfg.skin_opacity, 100);
+        assert_eq!(cfg.panel_opacity, 100);
+        // 下限保护
+        let mut low = Config::default();
+        low.panel_opacity = 0;
+        low.sanitize();
+        assert_eq!(low.panel_opacity, 20);
+        assert_eq!(cfg.window_opacity, 50);
+        assert_eq!(cfg.skin_preset, SkinPreset::Default);
 
         let mut ok = Config::default();
-        ok.auto_threshold_percent = 0;
+        ok.auto_threshold_percent = 30;
         ok.auto_interval_minutes = 30;
         ok.auto_cooldown_seconds = 120;
+        ok.window_opacity = 100;
         ok.sanitize();
-        assert_eq!(ok.auto_threshold_percent, 0);
+        assert_eq!(ok.auto_threshold_percent, 30);
         assert_eq!(ok.auto_interval_minutes, 30);
         assert_eq!(ok.auto_cooldown_seconds, 120);
+        assert_eq!(ok.window_opacity, 100);
+    }
+
+    #[test]
+    fn accent_and_skin_cycles() {
+        let mut a = AccentScheme::Blue;
+        for _ in 0..AccentScheme::ALL.len() {
+            a = a.next();
+        }
+        assert_eq!(a, AccentScheme::Blue);
+        let mut s = SkinPreset::Default;
+        for _ in 0..5 {
+            s = s.next();
+        }
+        assert_eq!(s, SkinPreset::Default);
+        assert_eq!(SkinPreset::Custom.next(), SkinPreset::Default);
     }
 
     #[test]

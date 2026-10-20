@@ -3,19 +3,25 @@
 //! 线程模型：UI/主线程只做绘制与状态切换；清理（0.2~2s 的阻塞系统调用）放到
 //! 一次性工作线程，完成后 PostMessage 回主线程，避免界面卡顿。
 
-use crate::config::{self, Config, ThemeMode};
+use crate::config::{self, Config, SkinPreset, ThemeMode};
 use crate::engine;
 use crate::platform::{
-    self, autostart, elevate, theme, tray::Tray, tray::TrayCommand, window, WM_APP_SHOW,
-    TIMER_ANIM, TIMER_TICK,
+    self, autostart, dialog, elevate, image, theme, tray::Tray, tray::TrayCommand, window,
+    WM_APP_SHOW, TIMER_ANIM, TIMER_TICK,
 };
 use crate::sys::{self, CleanError, CleanOutcome, MemStatus};
-use crate::ui::{self, format_bytes, layout, Action, CleanItem, ConfirmDialog, ConfirmKind, Page, Renderer, Toast, ToastKind, UiState};
+use crate::ui::{
+    self, format_bytes, Action, CleanItem, ConfirmDialog, ConfirmKind, OpacityKind, Page,
+    Renderer, SettingsTab, SkinImage, ThresholdEdit, Toast, ToastKind, UiState,
+};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TRACKMOUSEEVENT};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{BeginPaint, EndPaint, ScreenToClient, PAINTSTRUCT};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TRACKMOUSEEVENT,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 /// 清理工作线程完成通知。
@@ -24,6 +30,10 @@ const WM_APP_CLEAN_DONE: u32 = WM_APP + 3;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 /// DPI 变化。
 const WM_DPICHANGED: u32 = 0x02E0;
+/// 字符输入（阈值编辑用）。
+const WM_CHAR_MSG: u32 = 0x0102;
+/// 鼠标滚轮（阈值/滑块微调）。
+const WM_MOUSEWHEEL_MSG: u32 = 0x020A;
 
 /// 应用主体。
 pub struct App {
@@ -33,6 +43,7 @@ pub struct App {
     elevated: bool,
     is_dark: bool,
     page: Page,
+    settings_tab: SettingsTab,
     renderer: Renderer,
     tray: Tray,
 
@@ -40,6 +51,7 @@ pub struct App {
     anim_time: f32,
     last_frame: Instant,
     anim_timer_on: bool,
+    caret_phase: u32,
     display_percent: f32,
     display_used: f64,
     display_avail: f64,
@@ -52,11 +64,20 @@ pub struct App {
     clean_rx: Option<mpsc::Receiver<Result<CleanOutcome, CleanError>>>,
     last_freed: u64,
 
+    // 外观
+    skin: Option<Arc<SkinImage>>,
+    skin_loaded_path: String,
+
     // 交互
     hover: Option<Action>,
     pressed: Option<Action>,
+    drag_slider: Option<OpacityKind>,
+    opacity_dirty: bool,
     tracking_mouse: bool,
     visible: bool,
+    threshold_edit: Option<String>,
+    /// 刚进入阈值编辑：第一个数字键是否清空旧值（模拟全选替换）。
+    threshold_edit_fresh: bool,
 
     // 轻提示
     toast: Option<Toast>,
@@ -73,19 +94,43 @@ pub struct App {
 
 impl App {
     /// 创建应用（窗口必须已创建，随后由 main 把它挂到 GWLP_USERDATA）。
-    pub fn new(hwnd: HWND, cfg: Config, visible: bool, apply_autostart: bool, clean_on_start: bool) -> App {
+    pub fn new(
+        hwnd: HWND,
+        mut cfg: Config,
+        visible: bool,
+        apply_autostart: bool,
+        clean_on_start: bool,
+    ) -> App {
+        cfg.sanitize();
         let dpi = window::window_dpi(hwnd).max(96);
-        // 窗口初建时按系统 DPI 估算尺寸，这里按窗口实际所在显示器 DPI 校正，
-        // 否则 125%/150% 缩放下会出现绘制区与窗口尺寸不一致。
+        // 窗口初建时按系统 DPI 估算尺寸，这里按窗口实际所在显示器 DPI 校正。
         window::resize_for_dpi(hwnd, dpi);
         window::center_on_screen(hwnd);
         let is_dark = theme::resolve_is_dark(cfg.theme);
         let elevated = sys::is_elevated();
         let status = sys::mem_status();
-        let renderer = match Renderer::new(dpi) {
+        let mut renderer = match Renderer::new(dpi) {
             Some(r) => r,
             None => panic!("无法创建渲染器"),
         };
+
+        // 载入自定义皮肤（仅当配置为 Custom 且图片可解码）。
+        let mut skin: Option<Arc<SkinImage>> = None;
+        if cfg.skin_preset == SkinPreset::Custom && !cfg.skin_image.trim().is_empty() {
+            if let Some(img) = image::load_skin_image(&cfg.skin_image) {
+                let arc = Arc::new(img);
+                renderer.set_skin(Some(arc.clone()));
+                skin = Some(arc);
+            }
+        }
+        log_line(&format!(
+            "skin: preset={:?} image={} loaded={}",
+            cfg.skin_preset,
+            cfg.skin_image,
+            skin.is_some()
+        ));
+        // 应用整体窗口不透明度（分层窗口 alpha）。
+        window::set_window_opacity(hwnd, cfg.window_opacity);
 
         // 窗口图标
         unsafe {
@@ -109,11 +154,13 @@ impl App {
             elevated,
             is_dark,
             page: Page::Main,
+            settings_tab: SettingsTab::General,
             renderer,
             tray,
             anim_time: 0.0,
             last_frame: Instant::now(),
             anim_timer_on: false,
+            caret_phase: 0,
             display_percent: 0.0,
             display_used: 0.0,
             display_avail: 0.0,
@@ -123,10 +170,16 @@ impl App {
             clean_started: Instant::now(),
             clean_rx: None,
             last_freed: 0,
+            skin,
+            skin_loaded_path: String::new(),
             hover: None,
             pressed: None,
+            drag_slider: None,
+            opacity_dirty: false,
             tracking_mouse: false,
             visible,
+            threshold_edit: None,
+            threshold_edit_fresh: false,
             toast: None,
             toast_born: None,
             confirm: None,
@@ -134,6 +187,7 @@ impl App {
             last_stats: Instant::now(),
             apply_autostart_pending: apply_autostart,
         };
+        app.skin_loaded_path = app.cfg.skin_image.clone();
         app.sync_display_values();
         log_line("app started");
         app.autostart_installed = matches!(
@@ -147,7 +201,7 @@ impl App {
             window::set_visible(hwnd, true);
             app.request_animation();
         }
-        app.update_tray_tip();
+        app.update_tray();
         if clean_on_start {
             app.start_clean();
         }
@@ -189,6 +243,14 @@ impl App {
                 self.on_mouse_up(lparam);
                 0
             }
+            WM_CHAR_MSG => {
+                self.on_char(wparam as u32);
+                0
+            }
+            WM_MOUSEWHEEL_MSG => {
+                self.on_mouse_wheel(wparam, lparam);
+                0
+            }
             WM_APP_SHOW => {
                 self.show_window();
                 0
@@ -213,18 +275,32 @@ impl App {
                 0
             }
             WM_KEYDOWN => {
-                if wparam == 0x1B {
-                    // Esc：先关确认框，再关设置页，最后最小化到托盘
-                    if self.confirm.take().is_some() {
-                        window::invalidate(hwnd);
-                        return 0;
+                match wparam {
+                    // Esc：先取消阈值编辑，再关确认框，再关设置页，最后最小化到托盘
+                    0x1B => {
+                        if self.threshold_edit.take().is_some() {
+                            self.threshold_edit_fresh = false;
+                            window::invalidate(hwnd);
+                            return 0;
+                        }
+                        if self.confirm.take().is_some() {
+                            window::invalidate(hwnd);
+                            return 0;
+                        }
+                        if self.page == Page::Settings {
+                            self.page = Page::Main;
+                            window::invalidate(hwnd);
+                        } else if self.cfg.minimize_to_tray {
+                            self.hide_window();
+                        }
                     }
-                    if self.page == Page::Settings {
-                        self.page = Page::Main;
-                        window::invalidate(hwnd);
-                    } else if self.cfg.minimize_to_tray {
-                        self.hide_window();
+                    // Enter：提交阈值输入（部分输入法/键盘路径不会产生 WM_CHAR '\r'）
+                    0x0D => {
+                        if self.threshold_edit.is_some() {
+                            self.commit_threshold();
+                        }
                     }
+                    _ => {}
                 }
                 0
             }
@@ -246,11 +322,7 @@ impl App {
                 log_line(&format!("WM_NCLBUTTONDOWN wparam={wparam}"));
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
-            WM_NCHITTEST => {
-                // 让整个客户区都可点击（返回 HTCLIENT 由默认处理即可，这里只记录）
-                let r = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
-                r
-            }
+            WM_NCHITTEST => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
             msg if msg == platform::tray::TRAY_CALLBACK_MSG => {
                 if let Some(cmd) = self.tray.on_callback(lparam) {
                     self.on_tray_command(cmd);
@@ -268,7 +340,7 @@ impl App {
     fn on_stats_tick(&mut self) {
         self.status = sys::mem_status();
         self.sync_display_values();
-        self.update_tray_tip();
+        self.update_tray();
         // 自动清理判定
         self.maybe_auto_clean();
         // 轻提示老化
@@ -297,13 +369,45 @@ impl App {
         if self.cleaning {
             self.clean_progress = (self.clean_progress + dt / 1.2).min(1.0);
         }
-        if self.visible {
+
+        // 轻提示老化：动画定时器运行期间也更新 age，避免首次出现有 0–1s 延迟（fade-in 直接跳变）。
+        if self.toast_born.is_some() {
+            let age = self
+                .toast_born
+                .map(|b| b.elapsed().as_secs_f32())
+                .unwrap_or(0.0);
+            if let Some(t) = self.toast.as_mut() {
+                t.age = age;
+            }
+            if age > 3.2 {
+                self.toast = None;
+                self.toast_born = None;
+            }
+        }
+
+        // 阈值编辑时只需要在「光标闪烁相位」变化时重绘，避免 60fps 全速重绘。
+        let editing = self.threshold_edit.is_some();
+        let mut need_redraw = false;
+        if editing {
+            let phase = ((self.anim_time * 2.0) as u32) & 1;
+            if phase != self.caret_phase {
+                self.caret_phase = phase;
+                need_redraw = true;
+            }
+        }
+        if self.visible
+            && (need_redraw
+                || self.cleaning
+                || self.clean_flash_until.map(|t| t > now).unwrap_or(false)
+                || self.toast_born.map(|b| b.elapsed().as_secs_f32() < 0.4).unwrap_or(false))
+        {
             window::invalidate(self.hwnd);
         }
-        // 动画是否还需要继续
+
         let need = self.cleaning
             || self.clean_flash_until.map(|t| t > now).unwrap_or(false)
-            || self.toast_born.map(|b| b.elapsed().as_secs_f32() < 0.4).unwrap_or(false);
+            || self.toast_born.map(|b| b.elapsed().as_secs_f32() < 0.4).unwrap_or(false)
+            || editing;
         if !need {
             unsafe {
                 KillTimer(self.hwnd, TIMER_ANIM);
@@ -323,7 +427,7 @@ impl App {
     }
 
     // ------------------------------------------------------------------
-    // 鼠标交互
+    // 鼠标 / 键盘交互
     // ------------------------------------------------------------------
 
     fn logical_pos(&self, lparam: LPARAM) -> (f32, f32) {
@@ -350,6 +454,7 @@ impl App {
                 .unwrap_or(false),
             is_dark: self.is_dark,
             page: self.page,
+            settings_tab: self.settings_tab,
             settings: ui::SettingsSnapshot {
                 auto_enabled: self.cfg.auto_clean_enabled,
                 threshold: self.cfg.auto_threshold_percent,
@@ -363,6 +468,13 @@ impl App {
                 start_with_windows: self.cfg.start_with_windows,
                 theme: self.cfg.theme,
                 autostart_installed: self.autostart_installed,
+                tray_show_percent: self.cfg.tray_show_percent,
+                accent: self.cfg.accent,
+                skin_preset: self.cfg.skin_preset,
+                skin_image_name: self.cfg.skin_file_name(),
+                skin_opacity: self.cfg.skin_opacity,
+                panel_opacity: self.cfg.panel_opacity,
+                window_opacity: self.cfg.window_opacity,
             },
             last_freed_bytes: if self.last_freed > 0 {
                 self.last_freed
@@ -376,13 +488,110 @@ impl App {
             toast: self.toast.clone(),
             version: env!("CARGO_PKG_VERSION"),
             confirm: self.confirm.map(build_confirm_dialog),
+            threshold_editing: self
+                .threshold_edit
+                .as_ref()
+                .map(|t| ThresholdEdit { text: t.clone() }),
         }
+    }
+
+    fn on_char(&mut self, ch: u32) {
+        let fresh = self.threshold_edit_fresh;
+        let Some(edit) = self.threshold_edit.as_mut() else {
+            return;
+        };
+        match ch {
+            0x08 => {
+                // Backspace
+                edit.pop();
+                self.threshold_edit_fresh = false;
+                window::invalidate(self.hwnd);
+            }
+            0x0D => {
+                // Enter
+                self.commit_threshold();
+            }
+            0x1B => {
+                // Esc
+                self.threshold_edit = None;
+                window::invalidate(self.hwnd);
+            }
+            // 只接受数字，最多 3 位（30–100）；首次输入清空旧值（相当于全选）
+            0x30..=0x39 => {
+                if fresh {
+                    edit.clear();
+                    self.threshold_edit_fresh = false;
+                }
+                if edit.len() < 3 {
+                    if let Some(c) = char::from_u32(ch) {
+                        edit.push(c);
+                        window::invalidate(self.hwnd);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_mouse_wheel(&mut self, wparam: WPARAM, lparam: LPARAM) {
+        let delta = ((wparam >> 16) as u16 as i16) as i32;
+        if delta == 0 {
+            return;
+        }
+        // 光标应位于窗口内才响应（Windows 会把滚轮发给焦点窗口，这里再校验一次位置）。
+        let mut pt: POINT = unsafe { std::mem::zeroed() };
+        unsafe {
+            if GetCursorPos(&mut pt) == 0 {
+                return;
+            }
+            if ScreenToClient(self.hwnd, &mut pt) == 0 {
+                return;
+            }
+        }
+        let dpi = window::window_dpi(self.hwnd) as f32 / 96.0;
+        let (lx, ly) = (pt.x as f32 / dpi, pt.y as f32 / dpi);
+        let state = self.current_ui_state();
+        let Some(hit) = ui::hit_test(&state, lx, ly) else {
+            return;
+        };
+        let step = if delta > 0 { 1i32 } else { -1i32 };
+        match hit {
+            Action::EditThreshold => {
+                let v = (self.cfg.auto_threshold_percent as i32 + step).clamp(30, 100) as u8;
+                self.cfg.auto_threshold_percent = v;
+                self.save_config();
+                window::invalidate(self.hwnd);
+            }
+            Action::SetOpacity(kind, _) => {
+                let current = match kind {
+                    OpacityKind::Skin => self.cfg.skin_opacity,
+                    OpacityKind::Panel => self.cfg.panel_opacity,
+                    OpacityKind::Window => self.cfg.window_opacity,
+                } as i32;
+                let next = (current + step * 2).clamp(0, 100) as u8;
+                self.apply_opacity(kind, next);
+                self.save_config();
+            }
+            _ => {}
+        }
+        let _ = lparam;
     }
 
     fn on_mouse_move(&mut self, lparam: LPARAM) {
         let (lx, ly) = self.logical_pos(lparam);
         let state = self.current_ui_state();
         let hit = ui::hit_test(&state, lx, ly);
+
+        // 拖动滑块：实时更新数值（松手时统一保存配置）
+        if let Some(kind) = self.drag_slider {
+            if let Some(Action::SetOpacity(k, v)) = hit {
+                if k == kind {
+                    self.apply_opacity(kind, v);
+                    self.opacity_dirty = true;
+                }
+            }
+        }
+
         if hit != self.hover {
             self.hover = hit;
             window::invalidate(self.hwnd);
@@ -409,6 +618,13 @@ impl App {
             window::window_dpi(self.hwnd)
         ));
         self.pressed = hit;
+        self.drag_slider = None;
+        if let Some(Action::SetOpacity(kind, v)) = hit {
+            // 按下即跳到该位置，并进入拖动状态
+            self.drag_slider = Some(kind);
+            self.apply_opacity(kind, v);
+            self.opacity_dirty = true;
+        }
         if hit.is_some() {
             unsafe {
                 SetCapture(self.hwnd);
@@ -422,11 +638,21 @@ impl App {
 
     fn on_mouse_up(&mut self, lparam: LPARAM) {
         let pressed = self.pressed.take();
+        self.drag_slider = None;
         log_line(&format!("mouse_up pressed={pressed:?}"));
         unsafe {
             ReleaseCapture();
         }
+        if self.opacity_dirty {
+            self.save_config();
+            self.opacity_dirty = false;
+        }
         if let Some(action) = pressed {
+            // 滑块在按下/移动阶段已生效，松手不再重复触发动作。
+            if matches!(action, Action::SetOpacity(_, _)) {
+                window::invalidate(self.hwnd);
+                return;
+            }
             let (lx, ly) = self.logical_pos(lparam);
             let state = self.current_ui_state();
             if ui::hit_test(&state, lx, ly) == Some(action) {
@@ -446,13 +672,11 @@ impl App {
             Action::ConfirmAccept => {
                 let kind = self.confirm.take();
                 match kind {
-                    Some(ConfirmKind::ElevateClean) => {
-                        // 以管理员身份重启并立刻清理
-                        self.relaunch_elevated("--clean-on-start");
-                    }
+                    Some(ConfirmKind::ElevateClean) => self.relaunch_elevated("--clean-on-start"),
                     Some(ConfirmKind::ElevateAutoClean) => {
                         self.cfg.auto_clean_enabled = true;
-                        if self.cfg.auto_threshold_percent == 0 && self.cfg.auto_interval_minutes == 0 {
+                        if self.cfg.auto_threshold_percent == 0 && self.cfg.auto_interval_minutes == 0
+                        {
                             self.cfg.auto_threshold_percent = 85;
                         }
                         self.save_config();
@@ -474,10 +698,12 @@ impl App {
             Action::ToggleAutoClean => self.toggle_auto_clean(),
             Action::OpenSettings => {
                 self.page = Page::Settings;
+                self.settings_tab = SettingsTab::General;
                 self.request_animation();
                 window::invalidate(self.hwnd);
             }
             Action::CloseSettings => {
+                self.finish_threshold_edit();
                 self.page = Page::Main;
                 self.request_animation();
                 window::invalidate(self.hwnd);
@@ -500,6 +726,37 @@ impl App {
                 self.save_config();
                 window::invalidate(self.hwnd);
             }
+            Action::CycleAccent => {
+                self.cfg.accent = self.cfg.accent.next();
+                self.save_config();
+                self.show_toast(&format!("配色：{}", self.cfg.accent.display_name()), ToastKind::Info);
+            }
+            Action::CycleSkinPreset => {
+                self.cfg.skin_preset = self.cfg.skin_preset.next();
+                if self.cfg.skin_preset != SkinPreset::Custom {
+                    self.apply_skin(None);
+                }
+                self.save_config();
+                self.show_toast(
+                    &format!("皮肤：{}", self.cfg.skin_preset.display_name()),
+                    ToastKind::Info,
+                );
+            }
+            Action::PickCustomSkin => self.pick_custom_skin(),
+            Action::ClearCustomSkin => self.clear_custom_skin(),
+            Action::ToggleTrayPercent => {
+                self.cfg.tray_show_percent = !self.cfg.tray_show_percent;
+                self.save_config();
+                self.update_tray();
+                self.show_toast(
+                    if self.cfg.tray_show_percent {
+                        "托盘图标：显示内存占用率"
+                    } else {
+                        "托盘图标：普通图标"
+                    },
+                    ToastKind::Info,
+                );
+            }
             Action::ToggleAutostart => self.toggle_autostart(),
             Action::ToggleMinimizeToTray => {
                 self.cfg.minimize_to_tray = !self.cfg.minimize_to_tray;
@@ -513,25 +770,32 @@ impl App {
             }
             Action::ToggleCleanItem(item) => {
                 match item {
-                    CleanItem::WorkingSets => self.cfg.clean_working_sets = !self.cfg.clean_working_sets,
+                    CleanItem::WorkingSets => {
+                        self.cfg.clean_working_sets = !self.cfg.clean_working_sets
+                    }
                     CleanItem::Modified => self.cfg.clean_modified = !self.cfg.clean_modified,
                     CleanItem::Standby => self.cfg.clean_standby = !self.cfg.clean_standby,
-                    CleanItem::LowPriority => self.cfg.clean_low_priority = !self.cfg.clean_low_priority,
+                    CleanItem::LowPriority => {
+                        self.cfg.clean_low_priority = !self.cfg.clean_low_priority
+                    }
                     CleanItem::FileCache => self.cfg.trim_file_cache = !self.cfg.trim_file_cache,
                 }
                 self.save_config();
                 window::invalidate(self.hwnd);
             }
-            Action::CycleThreshold => {
-                self.cfg.auto_threshold_percent = match self.cfg.auto_threshold_percent {
-                    0..=64 => 70,
-                    65..=74 => 80,
-                    75..=84 => 85,
-                    85..=89 => 90,
-                    _ => 60,
-                };
-                self.save_config();
+            Action::EditThreshold => self.begin_threshold_edit(),
+            Action::CommitThreshold => self.commit_threshold(),
+            Action::SwitchTab(tab) => {
+                self.finish_threshold_edit();
+                self.settings_tab = tab;
+                self.hover = None;
+                self.pressed = None;
+                self.request_animation();
                 window::invalidate(self.hwnd);
+            }
+            Action::SetOpacity(kind, value) => {
+                self.apply_opacity(kind, value);
+                self.opacity_dirty = true;
             }
         }
     }
@@ -544,9 +808,6 @@ impl App {
             return;
         }
         self.cfg.auto_clean_enabled = enable;
-        if enable && self.cfg.auto_threshold_percent == 0 && self.cfg.auto_interval_minutes == 0 {
-            self.cfg.auto_threshold_percent = 85;
-        }
         self.save_config();
         self.show_toast(
             if enable {
@@ -595,6 +856,101 @@ impl App {
     }
 
     // ------------------------------------------------------------------
+    // 外观：阈值输入 / 皮肤 / 透明度
+    // ------------------------------------------------------------------
+
+    fn begin_threshold_edit(&mut self) {
+        self.page = Page::Settings;
+        self.settings_tab = SettingsTab::General;
+        self.threshold_edit = Some(self.cfg.auto_threshold_percent.to_string());
+        self.threshold_edit_fresh = true;
+        self.caret_phase = 0;
+        self.request_animation();
+        window::invalidate(self.hwnd);
+    }
+
+    /// 解析并应用阈值输入；无效输入或空输入保持原值。
+    fn commit_threshold(&mut self) {
+        let Some(text) = self.threshold_edit.take() else {
+            return;
+        };
+        self.threshold_edit_fresh = false;
+        let trimmed = text.trim();
+        let new_value = trimmed
+            .parse::<u16>()
+            .ok()
+            .map(|v| v.clamp(30, 100) as u8)
+            .unwrap_or(self.cfg.auto_threshold_percent);
+        if new_value != self.cfg.auto_threshold_percent {
+            self.cfg.auto_threshold_percent = new_value;
+            self.save_config();
+            self.show_toast(&format!("触发阈值已设为 {new_value}%"), ToastKind::Success);
+        }
+        window::invalidate(self.hwnd);
+    }
+
+    /// 离开设置页/切分页时若有未提交的输入则提交。
+    fn finish_threshold_edit(&mut self) {
+        if self.threshold_edit.is_some() {
+            self.commit_threshold();
+        }
+    }
+
+    fn apply_opacity(&mut self, kind: OpacityKind, value: u8) {
+        match kind {
+            OpacityKind::Skin => self.cfg.skin_opacity = value.min(100),
+            OpacityKind::Panel => self.cfg.panel_opacity = value.min(100),
+            OpacityKind::Window => {
+                let v = value.clamp(50, 100);
+                if self.cfg.window_opacity != v {
+                    self.cfg.window_opacity = v;
+                    window::set_window_opacity(self.hwnd, v);
+                }
+            }
+        }
+        window::invalidate(self.hwnd);
+    }
+
+    fn apply_skin(&mut self, skin: Option<Arc<SkinImage>>) {
+        self.skin = skin.clone();
+        self.renderer.set_skin(skin);
+        window::invalidate(self.hwnd);
+    }
+
+    fn pick_custom_skin(&mut self) {
+        let Some(path) = dialog::pick_image_file(self.hwnd) else {
+            return;
+        };
+        match image::load_skin_image(&path) {
+            Some(img) => {
+                let arc = Arc::new(img);
+                self.cfg.skin_image = path.clone();
+                self.cfg.skin_preset = SkinPreset::Custom;
+                self.apply_skin(Some(arc));
+                self.skin_loaded_path = path;
+                self.save_config();
+                self.show_toast("自定义皮肤已应用", ToastKind::Success);
+            }
+            None => {
+                self.show_toast("图片解码失败，请换一张图片", ToastKind::Error);
+            }
+        }
+    }
+
+    fn clear_custom_skin(&mut self) {
+        if self.cfg.skin_image.is_empty() && self.cfg.skin_preset != SkinPreset::Custom {
+            self.show_toast("当前没有自定义皮肤", ToastKind::Info);
+            return;
+        }
+        self.cfg.skin_image.clear();
+        self.cfg.skin_preset = SkinPreset::Default;
+        self.skin_loaded_path.clear();
+        self.apply_skin(None);
+        self.save_config();
+        self.show_toast("已恢复默认皮肤", ToastKind::Info);
+    }
+
+    // ------------------------------------------------------------------
     // 清理流程
     // ------------------------------------------------------------------
 
@@ -627,7 +983,7 @@ impl App {
         self.clean_started = Instant::now();
         self.clean_progress = 0.0;
         self.request_animation();
-        self.update_tray_tip();
+        self.update_tray();
         window::invalidate(self.hwnd);
     }
 
@@ -645,7 +1001,6 @@ impl App {
                 self.finish_clean_with_error(err);
             }
             Err(mpsc::TryRecvError::Empty) => {
-                // 还没完成，继续等
                 self.request_animation();
             }
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -669,14 +1024,18 @@ impl App {
         self.status = sys::mem_status();
         self.sync_display_values();
         let text = if reported >= 1024 * 1024 {
-            format!("已清理 {} 缓存，可用内存 +{}", format_bytes(reported as f64), format_bytes(freed.max(0) as f64))
+            format!(
+                "已清理 {} 缓存，可用内存 +{}",
+                format_bytes(reported as f64),
+                format_bytes(freed.max(0) as f64)
+            )
         } else if freed > 0 {
             format!("已清理 {} 内存", format_bytes(freed as f64))
         } else {
             "已优化到最佳状态".to_string()
         };
         self.show_toast(&text, ToastKind::Success);
-        self.update_tray_tip();
+        self.update_tray();
         log_line(&format!(
             "clean ok freed={} reclaimed={} bytes before={} after={} duration={}ms steps={:?}",
             outcome.reclaimed_bytes,
@@ -751,11 +1110,21 @@ impl App {
     }
 
     fn hide_window(&mut self) {
+        self.finish_threshold_edit();
+        if self.opacity_dirty {
+            self.save_config();
+            self.opacity_dirty = false;
+        }
         self.visible = false;
         window::set_visible(self.hwnd, false);
     }
 
     fn exit(&mut self) {
+        self.finish_threshold_edit();
+        if self.opacity_dirty {
+            self.save_config();
+            self.opacity_dirty = false;
+        }
         self.tray.remove();
         unsafe {
             DestroyWindow(self.hwnd);
@@ -790,6 +1159,8 @@ impl App {
             );
         }
         self.renderer.recreate(new_dpi);
+        // 分层窗口属性在尺寸变化后重新应用一次。
+        window::set_window_opacity(self.hwnd, self.cfg.window_opacity);
         window::invalidate(self.hwnd);
     }
 
@@ -820,13 +1191,20 @@ impl App {
         }
     }
 
-    fn update_tray_tip(&mut self) {
+    /// 刷新托盘提示文字，并按配置更新「图标显示占用率」。
+    fn update_tray(&mut self) {
         let tip = format!(
             "内存清理 · {}% 已用 {}",
             self.status.percent,
             format_bytes(self.status.used_bytes as f64)
         );
         self.tray.set_tip(&tip);
+        let percent = if self.cfg.tray_show_percent {
+            Some(self.status.percent)
+        } else {
+            None
+        };
+        self.tray.set_percent(percent);
     }
 
     fn show_toast(&mut self, text: &str, kind: ToastKind) {
@@ -893,7 +1271,11 @@ pub fn log_line(text: &str) {
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("memcleaner.log");
     let ts = config::unix_now();
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         use std::io::Write;
         let _ = writeln!(file, "[{ts}] {text}");
     }
@@ -911,4 +1293,3 @@ pub fn physical_size(dpi: u32) -> (i32, i32) {
         window::scale(ui::LOGICAL_H, dpi),
     )
 }
-

@@ -1,3 +1,9 @@
+> 版本说明：本报告主体是 v1.0.0 的 QA 记录；v1.1.0 新增外观/换肤/阈值直接输入/托盘占用率，
+> 并修复「收缩文件缓存」失败、阈值输入、toast 遮挡、配置 BOM 兼容、分层窗口圆角等问题。
+> v1.1.0 的回归结果见 [CHANGELOG.md](../CHANGELOG.md) 与 [VERIFICATION.md](VERIFICATION.md)
+> （`cargo test` 39 项通过 + 管理员权限实测，其中 `--self-test --with-file-cache` 的
+> `TrimFileCache` 步骤返回成功）。
+
 > 说明：本报告是项目开发期间在开发机上的验证记录，文中的绝对路径/进程号为当时的现场数据，复跑时请按你本机路径调整。
 
 # MemCleaner QA 测试报告（最终发布构建）

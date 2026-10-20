@@ -73,7 +73,17 @@ pub fn execute_clean(opts: &CleanOptions) -> Result<CleanOutcome, CleanError> {
         ));
     }
     if opts.trim_file_cache {
-        steps.push(sys::memory::trim_system_file_cache());
+        // 修复：SetSystemFileCacheSize(-1,-1,0) 需要 SeIncreaseQuotaPrivilege，
+        // 之前没有启用该特权导致勾选「收缩文件缓存」后整次清理以
+        // ERROR_PRIVILEGE_NOT_HELD(1314) 失败。这里先启用特权再收缩。
+        match sys::privilege::enable_increase_quota() {
+            Ok(()) => steps.push(sys::memory::trim_system_file_cache()),
+            Err(code) => steps.push(sys::StepReport {
+                name: "EnableSeIncreaseQuotaPrivilege",
+                success: false,
+                error_code: Some(code),
+            }),
+        }
     }
 
     // 任一必选步骤失败 → 报错（PCL 同样会在失败时抛出并提示）。

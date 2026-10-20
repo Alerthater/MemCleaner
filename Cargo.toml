@@ -1,12 +1,10 @@
 [package]
 name = "memcleaner"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
-description = "极简、低占用的 Windows 内存清理工具：Rust 独立实现的系统级内存清理，Win32 自绘 UI"
+description = "极简、低占用的 Windows 内存清理工具（逆向 PCL 启动器内存优化逻辑实现）"
 license = "MIT"
-repository = "https://github.com/Alerthater/MemCleaner"
-homepage = "https://github.com/Alerthater/MemCleaner"
-authors = ["Alerthater"]
+authors = ["MemCleaner"]
 
 [[bin]]
 name = "MemCleaner"
@@ -21,6 +19,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_HiDpi",
     "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
     "Win32_System_Time",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Threading",

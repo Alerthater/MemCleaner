@@ -31,7 +31,11 @@ impl Drop for InstanceGuard {
 /// 而不是 `ERROR_ALREADY_EXISTS(183)`。这种情况必须视为「已有实例」并唤醒它，
 /// 否则会出现双实例、配置互相覆盖（QA Bug-01）。
 pub fn acquire() -> Option<InstanceGuard> {
-    let name = wide("Local\\MemCleaner.SingleInstance.v1");
+    // 开发/自动化测试可用 MEMCLEANER_MUTEX_SUFFIX 隔离实例（正常用户不会设置）。
+    let suffix = std::env::var_os("MEMCLEANER_MUTEX_SUFFIX")
+        .map(|v| v.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let name = wide(&format!("Local\\MemCleaner.SingleInstance.v1{suffix}"));
     unsafe {
         let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
         let err = GetLastError();

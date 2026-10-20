@@ -28,8 +28,17 @@ pub fn run(args: &[String]) -> i32 {
     let list_before = sys::memory::query_memory_list();
     let mut list_after = list_before;
 
+    // 支持在自检里覆盖清理项（用于验证「收缩文件缓存」等进阶项）。
+    let mut options = sys::CleanOptions::default();
+    if args.iter().any(|a| a == "--with-file-cache") {
+        options.trim_file_cache = true;
+    }
+    if args.iter().any(|a| a == "--with-low-priority") {
+        options.purge_low_priority = true;
+    }
+
     if elevated {
-        match sys::clean(&sys::CleanOptions::default()) {
+        match sys::clean(&options) {
             Ok(outcome) => {
                 clean_ok = true;
                 reclaimed_bytes = outcome.reclaimed_bytes;

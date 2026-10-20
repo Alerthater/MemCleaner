@@ -156,3 +156,154 @@ fn create_icon_from_argb(pixels: &[u32], w: i32, h: i32) -> HICON {
         icon
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// 托盘「内存占用率」图标
+// ---------------------------------------------------------------------------
+
+/// 生成托盘用的内存占用率图标：深色圆底 + 使用率配色圆环 + 白色百分比数字。
+///
+/// 颜色规则：<75% 蓝色、75–89% 琥珀、>=90% 红色，方便一眼看出内存压力。
+pub fn tray_percent_icon(percent: u8, size: i32) -> HICON {
+    let size = size.clamp(12, 64);
+    let s = size as f32;
+    let mut pixels = vec![0u32; (size * size) as usize];
+    let center = s * 0.5;
+    let outer = s * 0.47;
+    let ring_w = (s * 0.12).max(1.6);
+    let ring_r = outer - ring_w * 0.5;
+    let ring_half = ring_w * 0.5;
+    let (cr, cg, cb) = if percent >= 90 {
+        (0xEF_u32, 0x44_u32, 0x44_u32)
+    } else if percent >= 75 {
+        (0xF5, 0x9E, 0x0B)
+    } else {
+        (0x4C, 0xC2, 0xFF)
+    };
+    let ring_color = (cr << 16) | (cg << 8) | cb;
+
+    for y in 0..size {
+        for x in 0..size {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let dx = px - center;
+            let dy = py - center;
+            let dist = (dx * dx + dy * dy).sqrt();
+            // 圆盘覆盖率（1px 抗锯齿）
+            let disk = (outer - dist + 0.5).clamp(0.0, 1.0);
+            if disk <= 0.0 {
+                continue;
+            }
+            // 深色底（自上而下轻微渐变，营造立体感）
+            let top = 0x27_2A_30_u32;
+            let bottom = 0x16_17_1B_u32;
+            let mut color = lerp_color(top, bottom, py / s);
+            // 外环
+            let ring_cov = (ring_half - (dist - ring_r).abs() + 0.5).clamp(0.0, 1.0);
+            if ring_cov > 0.0 {
+                color = blend(color, ring_color, ring_cov);
+            }
+            let a = (disk * 255.0).round() as u32;
+            pixels[(y * size + x) as usize] = bg_rgb(color, a);
+        }
+    }
+
+    // 数字：<=99 显示两位；100 显示三位（字体略小）
+    let text = format!("{percent}");
+    let font_px = if percent >= 100 {
+        ((s * 0.36).round() as i32).max(6)
+    } else {
+        ((s * 0.44).round() as i32).max(6)
+    };
+    create_icon_with_text(&pixels, size, size, &text, font_px, 0xF2_F2_F5)
+}
+
+/// 把 BGRA 像素数组做成 HICON，并在中央绘制一行文字（ClearType/抗锯齿）。
+fn create_icon_with_text(
+    pixels: &[u32],
+    w: i32,
+    h: i32,
+    text: &str,
+    font_px: i32,
+    color: u32,
+) -> HICON {
+    unsafe {
+        let hdc = CreateCompatibleDC(std::ptr::null_mut());
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        bmi.bmiHeader.biSizeImage = (w * h * 4) as u32;
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let color_bmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+        if color_bmp.is_null() || bits.is_null() {
+            DeleteDC(hdc);
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u32, pixels.len());
+
+        // 在 DIB 上绘制数字
+        let old = SelectObject(hdc, color_bmp as HGDIOBJ);
+        let face = super::wide("Segoe UI");
+        let font = CreateFontW(
+            -font_px,
+            0,
+            0,
+            0,
+            700,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            ANTIALIASED_QUALITY as u32,
+            (DEFAULT_PITCH | 1) as u32,
+            face.as_ptr(),
+        );
+        let old_font = SelectObject(hdc, font as HGDIOBJ);
+        SetBkMode(hdc, 1); // TRANSPARENT
+        SetTextColor(hdc, colorref(color));
+        let mut wtext = super::wide(text);
+        let mut rc = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        DrawTextW(
+            hdc,
+            wtext.as_mut_ptr(),
+            -1,
+            &mut rc,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        SelectObject(hdc, old_font);
+        DeleteObject(font as HGDIOBJ);
+        SelectObject(hdc, old);
+
+        // 掩码位图（单色，全 0 = 使用 alpha 通道）
+        let mask_bytes = vec![0u8; ((w as usize + 7) / 8 * h as usize).max(1)];
+        let mask_bmp = CreateBitmap(w, h, 1, 1, mask_bytes.as_ptr() as *const core::ffi::c_void);
+        let info = ICONINFO {
+            fIcon: 1,
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask_bmp,
+            hbmColor: color_bmp,
+        };
+        let icon = CreateIconIndirect(&info);
+        DeleteObject(color_bmp as HGDIOBJ);
+        DeleteObject(mask_bmp as HGDIOBJ);
+        DeleteDC(hdc);
+        icon
+    }
+}
+
+fn colorref(rgb: u32) -> u32 {
+    ((rgb & 0xFF) << 16) | (((rgb >> 8) & 0xFF) << 8) | ((rgb >> 16) & 0xFF)
+}

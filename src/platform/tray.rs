@@ -1,4 +1,7 @@
 //! 系统托盘图标与右键菜单。
+//!
+//! 支持可选的「图标直接显示内存占用率」：由 [`Tray::set_percent`] 动态生成带百分比数字的
+//! HICON 并通过 NIM_MODIFY 更新；关闭该选项时恢复普通应用图标。
 
 use super::icon;
 use super::wide;
@@ -34,18 +37,36 @@ const MENU_EXIT: usize = 1003;
 /// 托盘对象。持有图标句柄与菜单状态。
 pub struct Tray {
     hwnd: HWND,
+    /// 当前显示的图标。
     icon: HICON,
+    /// 普通应用图标（关闭占用率显示时使用）。
+    base_icon: HICON,
+    /// 系统小图标尺寸（随 DPI 变化）。
+    icon_size: i32,
     added: bool,
+    /// 当前图标对应的占用率状态：None = 从未设置；Some(None) = 普通图标。
+    shown_percent: Option<Option<u8>>,
 }
 
 impl Tray {
     /// 创建托盘（不自动添加图标，需调用 [`Tray::add`]）。
     pub fn new(hwnd: HWND) -> Self {
-        let icon = icon::app_icon(16);
+        let icon_size = unsafe {
+            let s = GetSystemMetrics(SM_CXSMICON);
+            if s > 0 {
+                s
+            } else {
+                16
+            }
+        };
+        let base_icon = icon::app_icon(icon_size);
         Tray {
             hwnd,
-            icon,
+            icon: base_icon,
+            base_icon,
+            icon_size,
             added: false,
+            shown_percent: Some(None),
         }
     }
 
@@ -75,6 +96,47 @@ impl Tray {
         nid.uID = TRAY_ID;
         nid.uFlags = NIF_TIP;
         copy_tip(&mut nid.szTip, tip);
+        unsafe {
+            Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    /// 设置托盘图标是否显示内存占用率。
+    ///
+    /// `percent = Some(p)` 时生成带百分比数字的图标；`None` 时恢复普通图标。
+    /// 只有状态变化时才重建图标（避免每秒创建 GDI 对象）。
+    pub fn set_percent(&mut self, percent: Option<u8>) {
+        if self.shown_percent == Some(percent) {
+            return;
+        }
+        self.shown_percent = Some(percent);
+        let new_icon = match percent {
+            Some(p) => icon::tray_percent_icon(p, self.icon_size),
+            None => self.base_icon,
+        };
+        if new_icon.is_null() {
+            return;
+        }
+        if !self.icon.is_null() && self.icon != self.base_icon {
+            unsafe {
+                DestroyIcon(self.icon);
+            }
+        }
+        self.icon = new_icon;
+        self.refresh_icon();
+    }
+
+    /// 通过 NIM_MODIFY 刷新通知区图标。
+    fn refresh_icon(&mut self) {
+        if !self.added {
+            return;
+        }
+        let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = self.hwnd;
+        nid.uID = TRAY_ID;
+        nid.uFlags = NIF_ICON;
+        nid.hIcon = self.icon;
         unsafe {
             Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
@@ -148,11 +210,15 @@ impl Tray {
 impl Drop for Tray {
     fn drop(&mut self) {
         self.remove();
-        if !self.icon.is_null() {
-            unsafe {
+        unsafe {
+            if !self.icon.is_null() && self.icon != self.base_icon {
                 let _ = DestroyIcon(self.icon);
             }
+            if !self.base_icon.is_null() {
+                let _ = DestroyIcon(self.base_icon);
+            }
             self.icon = std::ptr::null_mut();
+            self.base_icon = std::ptr::null_mut();
         }
     }
 }
