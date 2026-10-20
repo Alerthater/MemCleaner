@@ -1,6 +1,6 @@
 //! 物理内存状态读取与 `NtSetSystemInformation` 清理指令。
 //!
-//! 对应 PCL 2.13.1.1 `PageOtherTest.MemoryOptimizeInternal`：
+//! 行为参考 PCL 2.13.1.1 的「内存优化」（仅参考可观察行为，未复制其代码，见 NOTICE.md）：
 //! ```text
 //! for num = 2 To 4
 //!     NtSetSystemInformation(80, &num, 4)
