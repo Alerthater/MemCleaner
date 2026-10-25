@@ -1,0 +1,74 @@
+﻿<?xml version="1.0" encoding="UTF-16"?>
+
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+
+  <RegistrationInfo>
+
+    <Description>MemCleaner 内存清理：登录时以管理员权限静默启动到托盘，用于自动清理内存。</Description>
+
+    <URI>\MemCleaner AutoStart</URI>
+
+  </RegistrationInfo>
+
+  <Principals>
+
+    <Principal id="Author">
+
+      <UserId>S-1-5-21-948371736-1871337395-3398274781-1001</UserId>
+
+      <LogonType>InteractiveToken</LogonType>
+
+      <RunLevel>HighestAvailable</RunLevel>
+
+    </Principal>
+
+  </Principals>
+
+  <Settings>
+
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+
+    <StartWhenAvailable>true</StartWhenAvailable>
+
+    <IdleSettings>
+
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+
+      <RestartOnIdle>false</RestartOnIdle>
+
+    </IdleSettings>
+
+  </Settings>
+
+  <Triggers>
+
+    <LogonTrigger>
+
+      <UserId><计算机名>\<用户名></UserId>
+
+    </LogonTrigger>
+
+  </Triggers>
+
+  <Actions Context="Author">
+
+    <Exec>
+
+      <Command><安装目录>\MemCleaner.exe</Command>
+
+      <Arguments>--autostart</Arguments>
+
+      <WorkingDirectory><安装目录></WorkingDirectory>
+
+    </Exec>
+
+  </Actions>
+
+</Task>
+

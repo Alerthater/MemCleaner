@@ -22,6 +22,8 @@ pub const WM_APP_SHOW: u32 = WM_APP + 1;
 pub const TIMER_TICK: usize = 1;
 /// 动画定时器 ID。
 pub const TIMER_ANIM: usize = 2;
+/// 托盘图标添加失败后的重试定时器 ID。
+pub const TIMER_TRAY: usize = 3;
 
 /// Rust 字符串转以 NUL 结尾的 UTF-16（Windows API 入参）。
 pub fn wide(s: &str) -> Vec<u16> {

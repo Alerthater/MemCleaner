@@ -41,6 +41,30 @@ fn main() {
         attach_parent_console();
         std::process::exit(selftest::run(&args));
     }
+    // 开机自启诊断：输出现状（任务是否存在、指向哪个 exe、当前 exe）。
+    if args.iter().any(|a| a == "--autostart-status") {
+        attach_parent_console();
+        let exe = platform::elevate::current_exe();
+        let st = platform::autostart::status_for(&exe);
+        println!("exe={exe}");
+        println!("task={}", platform::autostart::TASK_NAME);
+        for line in app::diag_probe() {
+            println!("{line}");
+        }
+        match st {
+            platform::autostart::AutostartStatus::Installed => println!("status=installed"),
+            platform::autostart::AutostartStatus::NotInstalled => println!("status=not-installed"),
+            platform::autostart::AutostartStatus::Mismatched(cmd) => {
+                println!("status=mismatched");
+                println!("task_command={cmd}");
+            }
+            platform::autostart::AutostartStatus::Error(e) => {
+                println!("status=error");
+                println!("error={e}");
+            }
+        }
+        std::process::exit(0);
+    }
     // 无界面维护模式：安装 / 卸载开机自启计划任务（需要管理员权限）。
     if args.iter().any(|a| a == "--install-autostart" || a == "--uninstall-autostart") {
         attach_parent_console();
@@ -53,7 +77,11 @@ fn main() {
         };
         match result {
             Ok(()) => {
-                println!("{}", if install { "autostart installed" } else { "autostart removed" });
+                if install {
+                    println!("autostart installed: {exe}");
+                } else {
+                    println!("autostart removed");
+                }
                 std::process::exit(0);
             }
             Err(e) => {
@@ -82,6 +110,7 @@ fn main() {
     };
 
     let cfg = config::load();
+    app::diag_log(&format!("launch args={args:?}"));
     let hidden = app::start_hidden(&args);
     let apply_autostart = args.iter().any(|a| a == "--apply-autostart");
     let clean_on_start = args.iter().any(|a| a == "--clean-on-start");
@@ -154,6 +183,7 @@ fn print_help() {
     println!("  --self-test --with-file-cache  自检时附加「收缩文件缓存」项（需管理员，验证用）");
     println!("  --install-autostart       安装开机自启计划任务（需管理员）");
     println!("  --uninstall-autostart     卸载开机自启计划任务（需管理员）");
+    println!("  --autostart-status        诊断开机自启计划任务状态（是否安装/指向哪个 exe）");
     println!("  --version          显示版本");
     println!("  --help             显示帮助");
     println!();

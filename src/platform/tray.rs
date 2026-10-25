@@ -5,7 +5,7 @@
 
 use super::icon;
 use super::wide;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT};
+use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, POINT};
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW,
@@ -46,6 +46,8 @@ pub struct Tray {
     added: bool,
     /// 当前图标对应的占用率状态：None = 从未设置；Some(None) = 普通图标。
     shown_percent: Option<Option<u8>>,
+    /// 最近一次 NIM_ADD 失败的错误码（诊断用）。
+    last_error: u32,
 }
 
 impl Tray {
@@ -67,6 +69,7 @@ impl Tray {
             icon_size,
             added: false,
             shown_percent: Some(None),
+            last_error: 0,
         }
     }
 
@@ -81,8 +84,36 @@ impl Tray {
         nid.hIcon = self.icon;
         copy_tip(&mut nid.szTip, tip);
         let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) } != 0;
+        if !ok {
+            self.last_error = unsafe { GetLastError() };
+        }
         self.added = ok;
         ok
+    }
+
+    /// 最近一次添加失败的错误码（0 表示无/成功）。
+    pub fn last_error(&self) -> u32 {
+        self.last_error
+    }
+
+    /// 诊断信息：(NOTIFYICONDATAW 大小, 图标是否为空)。
+    pub fn debug_info(&self) -> (usize, bool) {
+        (
+            std::mem::size_of::<NOTIFYICONDATAW>(),
+            self.icon.is_null(),
+        )
+    }
+
+    /// 当前是否已成功添加过图标（不代表 Explorer 一定在显示）。
+    pub fn is_added(&self) -> bool {
+        self.added
+    }
+
+    /// 重新添加图标：用于 Explorer 重启（TaskbarCreated）后恢复托盘图标。
+    /// 与 `add` 不同，它会忽略 previous 状态，直接发 NIM_ADD。
+    pub fn ensure_added(&mut self, tip: &str) -> bool {
+        self.added = false;
+        self.add(tip)
     }
 
     /// 修改提示文字（如「内存 62%」）。

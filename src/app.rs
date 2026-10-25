@@ -7,7 +7,7 @@ use crate::config::{self, Config, SkinPreset, ThemeMode};
 use crate::engine;
 use crate::platform::{
     self, autostart, dialog, elevate, image, theme, tray::Tray, tray::TrayCommand, window,
-    WM_APP_SHOW, TIMER_ANIM, TIMER_TICK,
+    TIMER_ANIM, TIMER_TICK, TIMER_TRAY, WM_APP_SHOW,
 };
 use crate::sys::{self, CleanError, CleanOutcome, MemStatus};
 use crate::ui::{
@@ -46,6 +46,10 @@ pub struct App {
     settings_tab: SettingsTab,
     renderer: Renderer,
     tray: Tray,
+    /// Explorer 的 TaskbarCreated 消息（重启 Explorer 后用它恢复托盘图标）。
+    taskbar_created_msg: u32,
+    /// 托盘添加失败后的重试计数。
+    tray_retries: u8,
 
     // 动画
     anim_time: f32,
@@ -123,10 +127,10 @@ impl App {
                 skin = Some(arc);
             }
         }
-        log_line(&format!(
-            "skin: preset={:?} image={} loaded={}",
+        diag_log(&format!(
+            "start v{} visible={visible} elevated={elevated} skin={:?} loaded={}",
+            env!("CARGO_PKG_VERSION"),
             cfg.skin_preset,
-            cfg.skin_image,
             skin.is_some()
         ));
         // 应用整体窗口不透明度（分层窗口 alpha）。
@@ -139,8 +143,16 @@ impl App {
             SendMessageW(hwnd, WM_SETICON, 0 /*ICON_SMALL*/ as WPARAM, icon as LPARAM);
         }
 
+        // Explorer 重启后会广播 TaskbarCreated，用它恢复托盘图标（开机自启时 Explorer 可能尚未就绪）。
+        let taskbar_created_msg =
+            unsafe { RegisterWindowMessageW(platform::wide("TaskbarCreated").as_ptr()) };
         let mut tray = Tray::new(hwnd);
-        tray.add("内存清理");
+        let tray_ok = tray.add("内存清理");
+        let (nid_size, icon_null) = tray.debug_info();
+        diag_log(&format!(
+            "tray add ok={tray_ok} err={} struct={nid_size} icon_null={icon_null} taskbar_created_msg={taskbar_created_msg}",
+            tray.last_error()
+        ));
 
         // 主界面 1s 刷新；动画定时器按需开启。
         unsafe {
@@ -157,6 +169,8 @@ impl App {
             settings_tab: SettingsTab::General,
             renderer,
             tray,
+            taskbar_created_msg,
+            tray_retries: 0,
             anim_time: 0.0,
             last_frame: Instant::now(),
             anim_timer_on: false,
@@ -189,11 +203,8 @@ impl App {
         };
         app.skin_loaded_path = app.cfg.skin_image.clone();
         app.sync_display_values();
-        log_line("app started");
-        app.autostart_installed = matches!(
-            autostart::status(),
-            crate::platform::autostart::AutostartStatus::Installed
-        );
+        // v1.1.1：启动时同步/自动修复开机自启任务（任务缺失或指向旧路径时重建）。
+        app.refresh_autostart_state(visible);
         if app.apply_autostart_pending {
             app.apply_autostart_setting();
         }
@@ -202,6 +213,10 @@ impl App {
             app.request_animation();
         }
         app.update_tray();
+        // 托盘添加失败（例如登录时 Explorer 尚未就绪）：定时重试，而不是静默无图标。
+        if !tray_ok {
+            app.schedule_tray_retry();
+        }
         if clean_on_start {
             app.start_clean();
         }
@@ -210,6 +225,11 @@ impl App {
 
     /// 窗口消息分发。
     fn on_message(&mut self, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        // Explorer 重启：重新注册托盘图标（该消息值由 RegisterWindowMessageW 动态分配）。
+        if msg != 0 && msg == self.taskbar_created_msg {
+            self.on_taskbar_created();
+            return 0;
+        }
         match msg {
             WM_PAINT => {
                 self.paint(hwnd);
@@ -220,6 +240,7 @@ impl App {
                 match wparam {
                     TIMER_TICK => self.on_stats_tick(),
                     TIMER_ANIM => self.on_anim_tick(),
+                    TIMER_TRAY => self.on_tray_retry_tick(),
                     _ => {}
                 }
                 0
@@ -672,7 +693,9 @@ impl App {
             Action::ConfirmAccept => {
                 let kind = self.confirm.take();
                 match kind {
-                    Some(ConfirmKind::ElevateClean) => self.relaunch_elevated("--clean-on-start"),
+                    Some(ConfirmKind::ElevateClean) => {
+                        let _ = self.relaunch_elevated("--clean-on-start");
+                    }
                     Some(ConfirmKind::ElevateAutoClean) => {
                         self.cfg.auto_clean_enabled = true;
                         if self.cfg.auto_threshold_percent == 0 && self.cfg.auto_interval_minutes == 0
@@ -680,12 +703,16 @@ impl App {
                             self.cfg.auto_threshold_percent = 85;
                         }
                         self.save_config();
-                        self.relaunch_elevated("");
+                        let _ = self.relaunch_elevated("");
                     }
                     Some(ConfirmKind::ElevateAutostart) => {
                         self.cfg.start_with_windows = !self.cfg.start_with_windows;
                         self.save_config();
-                        self.relaunch_elevated("--apply-autostart");
+                        if !self.relaunch_elevated("--apply-autostart") {
+                            // UAC 被取消：回滚配置，避免「开关显示已开但计划任务不存在」
+                            self.cfg.start_with_windows = !self.cfg.start_with_windows;
+                            self.save_config();
+                        }
                     }
                     None => {}
                 }
@@ -699,6 +726,8 @@ impl App {
             Action::OpenSettings => {
                 self.page = Page::Settings;
                 self.settings_tab = SettingsTab::General;
+                // 进入设置页时重新核对计划任务（外部删除/程序移动后能自动修复）。
+                self.refresh_autostart_state(true);
                 self.request_animation();
                 window::invalidate(self.hwnd);
             }
@@ -853,6 +882,125 @@ impl App {
             }
         }
         window::invalidate(self.hwnd);
+    }
+
+    /// 同步并修复开机自启状态（v1.1.1）。
+    ///
+    /// - 配置为「开」但任务缺失/指向旧 exe → 自动重建（需管理员）；
+    /// - 配置为「关」但任务仍存在 → 删除任务，保持配置优先；
+    /// - 普通权限时只更新显示状态，不做修改。
+    fn refresh_autostart_state(&mut self, notify: bool) {
+        let exe = elevate::current_exe();
+        let status = autostart::status_for(&exe);
+        diag_log(&format!("autostart status: {status:?} exe={exe} config_on={}", self.cfg.start_with_windows));
+        match status {
+            autostart::AutostartStatus::Installed => {
+                self.autostart_installed = true;
+                if !self.cfg.start_with_windows && self.elevated {
+                    match autostart::uninstall() {
+                        Ok(()) => {
+                            self.autostart_installed = false;
+                            diag_log("autostart: task removed because config is off");
+                        }
+                        Err(e) => diag_log(&format!("autostart uninstall failed: {e}")),
+                    }
+                }
+            }
+            autostart::AutostartStatus::NotInstalled
+            | autostart::AutostartStatus::Mismatched(_) => {
+                self.autostart_installed = false;
+                if self.cfg.start_with_windows {
+                    if self.elevated {
+                        match autostart::install(&exe) {
+                            Ok(()) => {
+                                self.autostart_installed = true;
+                                diag_log("autostart: task repaired/reinstalled");
+                                if notify && self.visible {
+                                    self.show_toast("已自动修复开机自启", ToastKind::Success);
+                                }
+                            }
+                            Err(e) => {
+                                diag_log(&format!("autostart repair failed: {e}"));
+                                if notify && self.visible {
+                                    self.show_toast(
+                                        &format!("开机自启修复失败：{e}"),
+                                        ToastKind::Error,
+                                    );
+                                }
+                            }
+                        }
+                    } else if notify && self.visible {
+                        self.show_toast(
+                            "开机自启任务缺失，请以管理员身份运行以自动修复",
+                            ToastKind::Error,
+                        );
+                    }
+                }
+            }
+            autostart::AutostartStatus::Error(e) => {
+                diag_log(&format!("autostart status error: {e}"));
+                if notify && self.visible {
+                    self.show_toast(&format!("开机自启状态查询失败：{e}"), ToastKind::Error);
+                }
+            }
+        }
+        window::invalidate(self.hwnd);
+    }
+
+    /// 托盘图标添加失败时安排重试（开机自启时 Explorer 可能还没准备好）。
+    fn schedule_tray_retry(&mut self) {
+        self.tray_retries = 0;
+        unsafe {
+            SetTimer(self.hwnd, TIMER_TRAY, 1500, None);
+        }
+    }
+
+    /// 尝试（重新）添加托盘图标，成功返回 true。
+    fn try_tray_add(&mut self) -> bool {
+        let tip = format!(
+            "内存清理 · {}% 已用 {}",
+            self.status.percent,
+            format_bytes(self.status.used_bytes as f64)
+        );
+        let ok = self.tray.ensure_added(&tip);
+        if ok {
+            self.update_tray();
+        }
+        ok
+    }
+
+    fn on_tray_retry_tick(&mut self) {
+        self.tray_retries = self.tray_retries.saturating_add(1);
+        let ok = self.try_tray_add();
+        if ok {
+            diag_log(&format!("tray re-added after {} retries", self.tray_retries));
+            unsafe {
+                KillTimer(self.hwnd, TIMER_TRAY);
+            }
+            return;
+        }
+        if self.tray_retries >= 20 {
+            unsafe {
+                KillTimer(self.hwnd, TIMER_TRAY);
+            }
+            diag_log("tray add failed after 20 retries; showing window");
+            if !self.visible {
+                self.show_window();
+            }
+            self.show_toast("托盘图标初始化失败，已显示主窗口", ToastKind::Error);
+        }
+    }
+
+    /// Explorer 重启（TaskbarCreated）：恢复托盘图标。
+    fn on_taskbar_created(&mut self) {
+        diag_log("TaskbarCreated received; re-adding tray icon");
+        if self.try_tray_add() {
+            unsafe {
+                KillTimer(self.hwnd, TIMER_TRAY);
+            }
+        } else {
+            self.schedule_tray_retry();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1131,7 +1279,8 @@ impl App {
         }
     }
 
-    fn relaunch_elevated(&mut self, extra: &str) {
+    /// 请求以管理员身份重启；返回 false 表示 UAC 被取消或启动失败（此时进程继续运行）。
+    fn relaunch_elevated(&mut self, extra: &str) -> bool {
         let args = if extra.is_empty() {
             "--elevated".to_string()
         } else {
@@ -1139,9 +1288,11 @@ impl App {
         };
         if elevate::relaunch_elevated(&args) {
             self.exit();
+            true
         } else {
             self.show_toast("请求管理员权限失败", ToastKind::Error);
             window::invalidate(self.hwnd);
+            false
         }
     }
 
@@ -1258,6 +1409,75 @@ pub unsafe extern "system" fn wndproc(
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
     (*ptr).on_message(hwnd, msg, wparam, lparam)
+}
+
+/// 关键诊断日志：**始终写入**（用于排查「开机自启没反应」这类现场问题）。
+///
+/// 只记录启动、托盘添加结果、自启任务状态等少量关键行；文件超过 256 KB 自动清空。
+pub fn diag_log(text: &str) {
+    let ts = config::unix_now();
+    let line = format!("[{ts}] {text}\n");
+    for path in diag_log_candidates() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > 256 * 1024 {
+                let _ = std::fs::write(&path, b"");
+            }
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = file.write_all(line.as_bytes());
+            return;
+        }
+    }
+}
+
+/// 诊断日志候选路径（按优先级）：
+/// 1. 配置目录（正常情况）；2. exe 所在目录；3. 用户 TEMP；4. 系统 TEMP。
+///
+/// 登录自启等特殊场景下个别目录不可写时，自动落到下一个可写位置。
+pub fn diag_log_candidates() -> Vec<std::path::PathBuf> {
+    let mut v = Vec::new();
+    v.push(config::config_dir().join("memcleaner.log"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(dir.join("memcleaner.log"));
+        }
+    }
+    v.push(std::env::temp_dir().join("MemCleaner").join("memcleaner.log"));
+    v.push(std::path::PathBuf::from(r"C:\Windows\Temp\MemCleaner").join("memcleaner.log"));
+    v
+}
+
+/// 诊断探针：列出各候选日志路径是否可写（用于 --autostart-status / 故障排查）。
+pub fn diag_probe() -> Vec<String> {
+    let mut out = Vec::new();
+    out.push(format!(
+        "localappdata={:?}",
+        std::env::var_os("LOCALAPPDATA").map(|v| v.to_string_lossy().to_string())
+    ));
+    out.push(format!(
+        "temp={:?}",
+        std::env::var_os("TEMP").map(|v| v.to_string_lossy().to_string())
+    ));
+    out.push(format!(
+        "config_dir={}",
+        config::config_dir().display()
+    ));
+    for path in diag_log_candidates() {
+        let writable = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(_) => "OK".to_string(),
+            Err(e) => format!("FAIL({e})"),
+        };
+        out.push(format!("log {} write={writable}", path.display()));
+    }
+    out
 }
 
 /// 诊断日志（仅在设置 MEMCLEANER_LOG=1 或 debug 构建时写入文件，避免常驻开销）。

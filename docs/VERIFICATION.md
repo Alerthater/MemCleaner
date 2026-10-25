@@ -64,3 +64,12 @@
 
 > 数据来源：`docs/verify/run-meta.json`、`docs/verify/selftest-1.json`、`docs/verify/selftest-2.json`、
 > 独立探针 `tools/baseline-results\20261021-002536-verify-002529.json`；汇总结果 `docs/verify/verify-summary.json`。
+
+## 7. 开机自启修复验证（v1.1.1，2026-10-25）
+
+- 修复前：用户配置开启开机自启，但系统计划任务 `MemCleaner AutoStart` 实际不存在（被外部删除后无自愈），
+  登录时不会启动；此外旧版对含空格路径的 `<Command>` 加引号、登录时 Explorer 未就绪导致托盘注册失败无重试。
+- 修复后：安装/回读校验通过，任务 `LogonTrigger + HighestAvailable + Enabled`，`<Command>` 无引号且指向当前 exe；
+  删除任务后以管理员启动程序可自动重建；`schtasks /Run` 能启动 `--autostart` 且窗口隐藏驻留托盘；
+  真实用户会话（UAC 启动的管理员实例）托盘注册 `tray add ok=true`。
+- 本地内测报告：`docs/verify/autostart-fix.md`（含诊断日志与截图路径）。
