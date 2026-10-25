@@ -38,6 +38,54 @@ pub fn is_elevated() -> bool {
     }
 }
 
+/// 当前进程令牌的完整性级别 RID（0x2000=Medium，0x3000=High，0x1000=Low）。
+pub fn integrity_rid() -> u32 {
+    use windows_sys::Win32::Security::{GetSidSubAuthority, GetSidSubAuthorityCount, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL};
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return 0;
+        }
+        let mut buf = vec![0u8; 256];
+        let mut ret: u32 = 0;
+        let ok = GetTokenInformation(
+            token,
+            TokenIntegrityLevel as i32,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            buf.len() as u32,
+            &mut ret,
+        );
+        let mut rid = 0u32;
+        if ok != 0 {
+            let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+            let count = *GetSidSubAuthorityCount(label.Label.Sid) as u32;
+            if count > 0 {
+                rid = *GetSidSubAuthority(label.Label.Sid, count - 1);
+            }
+        }
+        CloseHandle(token);
+        rid
+    }
+}
+
+/// 当前进程能否「静默」执行系统级清理。
+///
+/// 需要：管理员令牌 + High（或更高）完整性 + 能启用 SeProfileSingleProcessPrivilege。
+/// 返回 Err 时附带可读原因（用于日志/提示）。
+pub fn can_clean_silently() -> Result<(), String> {
+    if !is_elevated() {
+        return Err("需要管理员权限".to_string());
+    }
+    let rid = integrity_rid();
+    if rid < 0x2000 {
+        return Err(format!("当前进程令牌被系统限制（完整性 0x{rid:04X}）"));
+    }
+    if let Err(code) = enable_profile_privilege() {
+        return Err(format!("无法启用 SeProfileSingleProcessPrivilege（错误码 {code}）"));
+    }
+    Ok(())
+}
+
 /// 启用一个特权（例如 SeProfileSingleProcessPrivilege）。
 /// 成功返回 Ok，失败返回 Win32 错误码。
 pub fn enable_privilege(name: &str) -> Result<(), u32> {

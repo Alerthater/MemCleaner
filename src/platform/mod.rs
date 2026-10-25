@@ -3,6 +3,7 @@
 //! 所有 unsafe FFI 都封装在这一层，业务层（app/ui/engine）只使用安全接口。
 
 pub mod autostart;
+pub mod diag;
 pub mod dialog;
 pub mod elevate;
 pub mod icon;

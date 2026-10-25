@@ -92,6 +92,14 @@ pub struct App {
 
     // 状态
     autostart_installed: bool,
+    /// 自动清理失败后的重试时间点（退避，避免每秒重试刷屏）。
+    auto_retry_at: Option<Instant>,
+    /// 连续失败次数。
+    auto_fail_count: u8,
+    /// 自动清理暂停原因（连续失败/权限受限）。
+    auto_pause_reason: Option<String>,
+    /// 「自动清理需要管理员」提示是否已显示。
+    auto_notice_shown: bool,
     last_stats: Instant,
     apply_autostart_pending: bool,
 }
@@ -198,6 +206,10 @@ impl App {
             toast_born: None,
             confirm: None,
             autostart_installed: false,
+            auto_retry_at: None,
+            auto_fail_count: 0,
+            auto_pause_reason: None,
+            auto_notice_shown: false,
             last_stats: Instant::now(),
             apply_autostart_pending: apply_autostart,
         };
@@ -849,11 +861,7 @@ impl App {
     }
 
     fn toggle_autostart(&mut self) {
-        if !self.elevated {
-            self.confirm = Some(ConfirmKind::ElevateAutostart);
-            window::invalidate(self.hwnd);
-            return;
-        }
+        // v1.2.0：用户级 Run 键自启，不需要管理员权限，也不弹 UAC。
         self.cfg.start_with_windows = !self.cfg.start_with_windows;
         self.apply_autostart_setting();
     }
@@ -869,7 +877,7 @@ impl App {
             Ok(()) => {
                 self.autostart_installed = self.cfg.start_with_windows;
                 let text = if self.cfg.start_with_windows {
-                    "开机自启已启用"
+                    "开机自启已启用（登录后自动驻留托盘）"
                 } else {
                     "开机自启已关闭"
                 };
@@ -884,23 +892,26 @@ impl App {
         window::invalidate(self.hwnd);
     }
 
-    /// 同步并修复开机自启状态（v1.1.1）。
+    /// 同步并修复用户级开机自启（v1.2.0）。
     ///
-    /// - 配置为「开」但任务缺失/指向旧 exe → 自动重建（需管理员）；
-    /// - 配置为「关」但任务仍存在 → 删除任务，保持配置优先；
-    /// - 普通权限时只更新显示状态，不做修改。
+    /// - 配置为开但注册表项缺失/指向旧路径 → 自动重建（普通权限即可）；
+    /// - 配置为关但注册表项存在 → 删除；
+    /// - 管理员实例下顺带删除 v1.1.x 的旧最高权限任务（它会被系统以受限令牌启动）。
     fn refresh_autostart_state(&mut self, notify: bool) {
         let exe = elevate::current_exe();
         let status = autostart::status_for(&exe);
-        diag_log(&format!("autostart status: {status:?} exe={exe} config_on={}", self.cfg.start_with_windows));
+        diag_log(&format!(
+            "autostart status: {status:?} exe={exe} config_on={} elevated={}",
+            self.cfg.start_with_windows, self.elevated
+        ));
         match status {
             autostart::AutostartStatus::Installed => {
                 self.autostart_installed = true;
-                if !self.cfg.start_with_windows && self.elevated {
+                if !self.cfg.start_with_windows {
                     match autostart::uninstall() {
                         Ok(()) => {
                             self.autostart_installed = false;
-                            diag_log("autostart: task removed because config is off");
+                            diag_log("autostart: removed because config is off");
                         }
                         Err(e) => diag_log(&format!("autostart uninstall failed: {e}")),
                     }
@@ -910,30 +921,20 @@ impl App {
             | autostart::AutostartStatus::Mismatched(_) => {
                 self.autostart_installed = false;
                 if self.cfg.start_with_windows {
-                    if self.elevated {
-                        match autostart::install(&exe) {
-                            Ok(()) => {
-                                self.autostart_installed = true;
-                                diag_log("autostart: task repaired/reinstalled");
-                                if notify && self.visible {
-                                    self.show_toast("已自动修复开机自启", ToastKind::Success);
-                                }
-                            }
-                            Err(e) => {
-                                diag_log(&format!("autostart repair failed: {e}"));
-                                if notify && self.visible {
-                                    self.show_toast(
-                                        &format!("开机自启修复失败：{e}"),
-                                        ToastKind::Error,
-                                    );
-                                }
+                    match autostart::install(&exe) {
+                        Ok(()) => {
+                            self.autostart_installed = true;
+                            diag_log("autostart: repaired/reinstalled (user Run key)");
+                            if notify && self.visible {
+                                self.show_toast("已自动修复开机自启", ToastKind::Success);
                             }
                         }
-                    } else if notify && self.visible {
-                        self.show_toast(
-                            "开机自启任务缺失，请以管理员身份运行以自动修复",
-                            ToastKind::Error,
-                        );
+                        Err(e) => {
+                            diag_log(&format!("autostart repair failed: {e}"));
+                            if notify && self.visible {
+                                self.show_toast(&format!("开机自启修复失败：{e}"), ToastKind::Error);
+                            }
+                        }
                     }
                 }
             }
@@ -942,6 +943,13 @@ impl App {
                 if notify && self.visible {
                     self.show_toast(&format!("开机自启状态查询失败：{e}"), ToastKind::Error);
                 }
+            }
+        }
+        // 迁移：删除 v1.1.x 的最高权限计划任务（需要管理员；删不掉也不影响，--autostart 会自检退出）。
+        if self.elevated && autostart::old_task_exists() {
+            match autostart::uninstall_old_task() {
+                Ok(()) => diag_log("autostart: old elevated task removed"),
+                Err(e) => diag_log(&format!("autostart: remove old task failed: {e}")),
             }
         }
         window::invalidate(self.hwnd);
@@ -1111,7 +1119,8 @@ impl App {
             self.show_toast("请先在设置中选择至少一个清理项", ToastKind::Error);
             return;
         }
-        if !self.elevated {
+        if let Err(reason) = sys::can_clean_silently() {
+            diag_log(&format!("clean unavailable in current process: {reason}"));
             self.confirm = Some(ConfirmKind::ElevateClean);
             window::invalidate(self.hwnd);
             return;
@@ -1160,6 +1169,9 @@ impl App {
 
     fn finish_clean_success(&mut self, outcome: CleanOutcome) {
         self.cleaning = false;
+        self.auto_fail_count = 0;
+        self.auto_retry_at = None;
+        self.auto_pause_reason = None;
         self.clean_progress = 1.0;
         self.clean_flash_until = Some(Instant::now() + Duration::from_secs(2));
         // 展示口径：优先用「实际回收的缓存量」（standby+modified 下降），
@@ -1184,7 +1196,7 @@ impl App {
         };
         self.show_toast(&text, ToastKind::Success);
         self.update_tray();
-        log_line(&format!(
+        diag_log(&format!(
             "clean ok freed={} reclaimed={} bytes before={} after={} duration={}ms steps={:?}",
             outcome.reclaimed_bytes,
             outcome.freed_bytes,
@@ -1206,30 +1218,68 @@ impl App {
         self.clean_progress = 0.0;
         let text = if matches!(err, CleanError::NotElevated) {
             "清理失败：请以管理员身份运行".to_string()
+        } else if matches!(err, CleanError::Privilege { .. }) {
+            "清理失败：当前进程权限受限，请以管理员身份运行".to_string()
         } else {
             format!("清理失败：{err}")
         };
         self.show_toast(&text, ToastKind::Error);
-        log_line(&format!("clean error: {err}"));
+        diag_log(&format!("clean FAILED: {err}"));
+        // 自动清理失败退避：60s、120s、240s…最多 10 分钟；连续 3 次失败后暂停自动清理。
+        self.auto_fail_count = self.auto_fail_count.saturating_add(1);
+        let backoff = 60u64.saturating_mul(1u64 << (self.auto_fail_count.saturating_sub(1).min(4)));
+        self.auto_retry_at = Some(Instant::now() + Duration::from_secs(backoff.min(600)));
+        if self.auto_fail_count >= 3 && self.auto_pause_reason.is_none() {
+            let reason = format!("自动清理已暂停（连续失败：{err}）");
+            diag_log(&format!("auto clean paused: {err}"));
+            self.auto_pause_reason = Some(reason.clone());
+            self.show_toast(&reason, ToastKind::Error);
+        }
         window::invalidate(self.hwnd);
     }
 
     fn maybe_auto_clean(&mut self) {
-        if self.cleaning || !self.elevated || !self.cfg.auto_clean_configured() {
+        if self.cleaning || !self.cfg.auto_clean_configured() {
             return;
+        }
+        if let Some(reason) = &self.auto_pause_reason {
+            let _ = reason;
+            return;
+        }
+        if let Some(at) = self.auto_retry_at {
+            if Instant::now() < at {
+                return;
+            }
         }
         let since = if self.cfg.last_clean_unix > 0 {
             Some(config::unix_now().saturating_sub(self.cfg.last_clean_unix))
         } else {
             None
         };
-        if engine::should_auto_clean(&self.cfg, &self.status, since) {
-            log_line(&format!(
-                "auto clean triggered: usage={}% threshold={}% since={:?}s",
-                self.status.percent, self.cfg.auto_threshold_percent, since
-            ));
-            self.start_clean();
+        if !engine::should_auto_clean(&self.cfg, &self.status, since) {
+            return;
         }
+        // 权限不足时不再每秒重试：提示一次并延后 10 分钟再判断。
+        if let Err(reason) = sys::can_clean_silently() {
+            diag_log(&format!(
+                "auto clean skipped (not capable): {reason}; usage={}% threshold={}%",
+                self.status.percent, self.cfg.auto_threshold_percent
+            ));
+            if !self.auto_notice_shown {
+                self.auto_notice_shown = true;
+                self.show_toast(
+                    "自动清理需要管理员权限：请点击「清理内存」完成一次提权",
+                    ToastKind::Info,
+                );
+            }
+            self.auto_retry_at = Some(Instant::now() + Duration::from_secs(600));
+            return;
+        }
+        diag_log(&format!(
+            "auto clean trigger: usage={}% threshold={}% since={since:?}s",
+            self.status.percent, self.cfg.auto_threshold_percent
+        ));
+        self.start_clean();
     }
 
     // ------------------------------------------------------------------

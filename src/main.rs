@@ -51,18 +51,25 @@ fn main() {
         for line in app::diag_probe() {
             println!("{line}");
         }
+        for line in platform::diag::environment_report() {
+            println!("{line}");
+        }
         match st {
             platform::autostart::AutostartStatus::Installed => println!("status=installed"),
             platform::autostart::AutostartStatus::NotInstalled => println!("status=not-installed"),
             platform::autostart::AutostartStatus::Mismatched(cmd) => {
                 println!("status=mismatched");
-                println!("task_command={cmd}");
+                println!("run_value={cmd}");
             }
             platform::autostart::AutostartStatus::Error(e) => {
                 println!("status=error");
                 println!("error={e}");
             }
         }
+        if let Some(cmd) = platform::autostart::user_autostart_command() {
+            println!("run_value={cmd}");
+        }
+        println!("old_task_exists={}", platform::autostart::old_task_exists());
         std::process::exit(0);
     }
     // 无界面维护模式：安装 / 卸载开机自启计划任务（需要管理员权限）。
@@ -94,10 +101,24 @@ fn main() {
     // 必须在任何窗口/DC 创建之前设置 DPI 感知。
     platform::window::init_dpi_awareness();
 
+    // 受限令牌（Low 完整性）的 --autostart 实例直接退出：
+    // 常见于从被标记为低完整性的目录（如开发工具工作区）启动；让它快速退出，
+    // 把单实例让给用户级自启（普通权限）实例。
+    let hidden = app::start_hidden(&args);
+    if hidden {
+        let rid = sys::integrity_rid();
+        if rid < 0x2000 {
+            app::diag_log(&format!(
+                "autostart instance has restricted token (integrity 0x{rid:04X}); exit"
+            ));
+            return;
+        }
+    }
+
     // 单实例：提权重启时旧实例正在退出，需要短暂重试等待互斥体释放。
-    let wait_for_previous = args
-        .iter()
-        .any(|a| a == "--elevated" || a == "--apply-autostart" || a == "--clean-on-start");
+    let wait_for_previous = args.iter().any(|a| {
+        a == "--elevated" || a == "--apply-autostart" || a == "--clean-on-start" || a == "--autostart"
+    });
     let _guard = if wait_for_previous {
         acquire_with_retry(4000)
     } else {
@@ -111,7 +132,9 @@ fn main() {
 
     let cfg = config::load();
     app::diag_log(&format!("launch args={args:?}"));
-    let hidden = app::start_hidden(&args);
+    for line in platform::diag::environment_report() {
+        app::diag_log(&line);
+    }
     let apply_autostart = args.iter().any(|a| a == "--apply-autostart");
     let clean_on_start = args.iter().any(|a| a == "--clean-on-start");
 

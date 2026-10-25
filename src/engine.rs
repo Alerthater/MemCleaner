@@ -40,10 +40,15 @@ pub fn execute_clean(opts: &CleanOptions) -> Result<CleanOutcome, CleanError> {
     let list_before = sys::memory::query_memory_list();
     let mut steps = Vec::with_capacity(5);
 
-    sys::privilege::enable_profile_privilege().map_err(|code| CleanError::Privilege {
-        name: "SeProfileSingleProcessPrivilege",
-        code,
-    })?;
+    if let Err(code) = sys::privilege::enable_profile_privilege() {
+        crate::app::diag_log(&format!(
+            "clean FAILED: cannot enable SeProfileSingleProcessPrivilege (code={code})"
+        ));
+        return Err(CleanError::Privilege {
+            name: "SeProfileSingleProcessPrivilege",
+            code,
+        });
+    }
 
     // 与 PCL 完全相同的三条指令，顺序 2 → 3 → 4。
     if opts.empty_working_sets {
@@ -88,6 +93,12 @@ pub fn execute_clean(opts: &CleanOptions) -> Result<CleanOutcome, CleanError> {
 
     // 任一必选步骤失败 → 报错（PCL 同样会在失败时抛出并提示）。
     if let Some(failed) = steps.iter().find(|s| !s.success) {
+        for s in &steps {
+            crate::app::diag_log(&format!(
+                "clean step {} ok={} err={:?}",
+                s.name, s.success, s.error_code
+            ));
+        }
         return Err(CleanError::Step {
             name: failed.name,
             code: failed.error_code.unwrap_or(0),

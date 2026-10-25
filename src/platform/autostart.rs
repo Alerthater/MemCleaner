@@ -40,25 +40,28 @@ impl AutostartStatus {
 }
 
 /// 查询计划任务是否存在（不校验路径）。
+/// 查询用户级自启状态（不校验路径）。
 pub fn status() -> AutostartStatus {
-    if run_schtasks(&["/Query", "/TN", TASK_NAME]).unwrap_or(false) {
-        AutostartStatus::Installed
-    } else {
-        AutostartStatus::NotInstalled
+    match read_run_value() {
+        Ok(Some(_)) => AutostartStatus::Installed,
+        Ok(None) => AutostartStatus::NotInstalled,
+        Err(e) => AutostartStatus::Error(e),
     }
 }
 
 /// 查询任务并校验它指向的 exe 是否就是 `exe_path`。
+/// 查询用户级自启是否指向 `exe_path`。
 pub fn status_for(exe_path: &str) -> AutostartStatus {
-    match task_command() {
-        Some(command) => {
-            if path_matches(&command, exe_path) {
+    match read_run_value() {
+        Ok(Some(value)) => {
+            if path_matches(&value, exe_path) {
                 AutostartStatus::Installed
             } else {
-                AutostartStatus::Mismatched(command)
+                AutostartStatus::Mismatched(value)
             }
         }
-        None => AutostartStatus::NotInstalled,
+        Ok(None) => AutostartStatus::NotInstalled,
+        Err(e) => AutostartStatus::Error(e),
     }
 }
 
@@ -80,49 +83,35 @@ pub fn task_command() -> Option<String> {
 /// 安装（或更新）自启计划任务。需要管理员权限。
 ///
 /// 创建后会回读任务 XML 校验路径；失败时返回可读错误。
+/// 安装用户级自启（HKCU Run，不需要管理员），并清理旧版计划任务。
 pub fn install(exe_path: &str) -> Result<(), String> {
     if exe_path.trim().is_empty() {
         return Err("程序路径为空".to_string());
     }
-    let user = current_user_id();
-    let xml = task_xml(exe_path, &user);
-    let dir = std::env::temp_dir().join("MemCleaner");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
-    let xml_path = dir.join("autostart-task.xml");
-
-    // Task Scheduler 要求 XML 为 UTF-16（带 BOM）。
-    let mut utf16: Vec<u8> = vec![0xFF, 0xFE];
-    for unit in xml.encode_utf16() {
-        utf16.extend_from_slice(&unit.to_le_bytes());
+    let command = format!("\"{}\" --autostart", exe_path.trim());
+    write_run_value(&command)?;
+    match read_run_value() {
+        Ok(Some(v)) if v == command => {}
+        Ok(Some(v)) => return Err(format!("开机自启写入后不一致：{v}")),
+        Ok(None) => return Err("开机自启写入后查询不到（可能被安全软件拦截）".to_string()),
+        Err(e) => return Err(e),
     }
-    std::fs::write(&xml_path, utf16).map_err(|e| format!("写入任务 XML 失败：{e}"))?;
-
-    let xml_str = xml_path.to_string_lossy().to_string();
-    if !run_schtasks(&["/Create", "/TN", TASK_NAME, "/XML", &xml_str, "/F"])? {
-        return Err("创建计划任务失败（请确认以管理员身份运行）".to_string());
+    if crate::sys::is_elevated() {
+        let _ = uninstall_old_task();
+        let _ = uninstall_clean_task();
     }
-    // 回读校验：确保任务确实存在且指向当前 exe。
-    match status_for(exe_path) {
-        AutostartStatus::Installed => Ok(()),
-        AutostartStatus::Mismatched(cmd) => Err(format!(
-            "计划任务已创建但指向的路径不一致（任务：{cmd}，当前：{exe_path}）"
-        )),
-        AutostartStatus::NotInstalled => Err("计划任务创建后查询不到，可能被系统策略阻止".to_string()),
-        AutostartStatus::Error(e) => Err(format!("计划任务创建后校验失败：{e}")),
-    }
+    Ok(())
 }
 
 /// 卸载自启计划任务。需要管理员权限；任务不存在时视为成功（幂等）。
+/// 卸载用户级自启（HKCU Run，幂等），并清理旧版计划任务。
 pub fn uninstall() -> Result<(), String> {
-    if matches!(status(), AutostartStatus::NotInstalled) {
-        return Ok(());
+    delete_run_value()?;
+    if crate::sys::is_elevated() {
+        let _ = uninstall_old_task();
+        let _ = uninstall_clean_task();
     }
-    let ok = run_schtasks(&["/Delete", "/TN", TASK_NAME, "/F"])?;
-    if ok || matches!(status(), AutostartStatus::NotInstalled) {
-        Ok(())
-    } else {
-        Err("删除计划任务失败（任务可能不存在或权限不足）".to_string())
-    }
+    Ok(())
 }
 
 /// 启动一个计划任务（用于自检/验证）。需要管理员权限。
@@ -157,8 +146,21 @@ fn current_user_id() -> String {
 }
 
 /// 把 exe 路径规范化后比较（去引号、统一斜杠、忽略大小写）。
-pub fn path_matches(a: &str, b: &str) -> bool {
-    normalize_path(a) == normalize_path(b)
+pub fn path_matches(run_value: &str, exe_path: &str) -> bool {
+    normalize_path(extract_exe_path(run_value))
+        == normalize_path(exe_path.trim().trim_matches('"'))
+        || normalize_path(run_value) == normalize_path(exe_path)
+}
+
+/// 从「"C:\path\app.exe" --args」里取出 exe 路径。
+fn extract_exe_path(s: &str) -> &str {
+    let t = s.trim();
+    if let Some(rest) = t.strip_prefix('"') {
+        if let Some(end) = rest.find('"') {
+            return &t[1..end + 1];
+        }
+    }
+    t.split_whitespace().next().unwrap_or("")
 }
 
 fn normalize_path(s: &str) -> String {
@@ -284,6 +286,148 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+// ---------------------------------------------------------------------------
+// 用户级自启（HKCU\Software\Microsoft\Windows\CurrentVersion\Run）
+// ---------------------------------------------------------------------------
+
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "MemCleaner";
+
+/// 读取用户级自启命令行。
+pub fn user_autostart_command() -> Option<String> {
+    read_run_value().ok().flatten()
+}
+
+/// 删除旧版计划任务 `MemCleaner AutoStart`（需管理员，幂等）。
+pub fn uninstall_old_task() -> Result<(), String> {
+    if run_schtasks(&["/Delete", "/TN", TASK_NAME, "/F"]).unwrap_or(false) {
+        return Ok(());
+    }
+    if run_schtasks(&["/Query", "/TN", TASK_NAME]).unwrap_or(false) {
+        Err("删除旧版计划任务失败（权限不足）".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// 清理 v1.1.1 可能存在的清理任务（幂等）。
+pub fn uninstall_clean_task() -> Result<(), String> {
+    let _ = run_schtasks(&["/Delete", "/TN", "MemCleaner Clean", "/F"]);
+    Ok(())
+}
+
+/// 旧版计划任务是否存在（迁移/诊断用）。
+pub fn old_task_exists() -> bool {
+    run_schtasks(&["/Query", "/TN", TASK_NAME]).unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn read_run_value() -> Result<Option<String>, String> {
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE,
+        REG_SZ,
+    };
+    unsafe {
+        let mut key: HKEY = std::ptr::null_mut();
+        let path = super::wide(RUN_KEY);
+        let rc = RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_QUERY_VALUE, &mut key);
+        if rc == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if rc != 0 {
+            return Err(format!("打开注册表失败（{rc}）"));
+        }
+        let name = super::wide(RUN_VALUE);
+        let mut ty: u32 = 0;
+        let mut size: u32 = 0;
+        let rc = RegQueryValueExW(
+            key, name.as_ptr(), std::ptr::null_mut(), &mut ty, std::ptr::null_mut(), &mut size,
+        );
+        if rc == ERROR_FILE_NOT_FOUND || size == 0 {
+            RegCloseKey(key);
+            return Ok(None);
+        }
+        if rc != 0 {
+            RegCloseKey(key);
+            return Err(format!("查询自启项失败（{rc}）"));
+        }
+        let mut buf = vec![0u8; size as usize + 2];
+        let mut real_size = size;
+        let rc = RegQueryValueExW(
+            key, name.as_ptr(), std::ptr::null_mut(), &mut ty, buf.as_mut_ptr(), &mut real_size,
+        );
+        RegCloseKey(key);
+        if rc != 0 {
+            return Err(format!("读取自启项失败（{rc}）"));
+        }
+        if ty != REG_SZ {
+            return Err("自启项类型异常".to_string());
+        }
+        let u16s: Vec<u16> = buf[..real_size as usize]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|c| *c != 0)
+            .collect();
+        Ok(Some(String::from_utf16_lossy(&u16s)))
+    }
+}
+
+#[cfg(windows)]
+fn write_run_value(value: &str) -> Result<(), String> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
+        REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
+    unsafe {
+        let mut key: HKEY = std::ptr::null_mut();
+        let path = super::wide(RUN_KEY);
+        let mut disposition = 0u32;
+        let rc = RegCreateKeyExW(
+            HKEY_CURRENT_USER, path.as_ptr(), 0, std::ptr::null_mut(),
+            REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, std::ptr::null_mut(), &mut key, &mut disposition,
+        );
+        if rc != 0 {
+            return Err(format!("打开注册表失败（{rc}）"));
+        }
+        let name = super::wide(RUN_VALUE);
+        let data: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes = std::slice::from_raw_parts(
+            data.as_ptr() as *const u8,
+            data.len() * std::mem::size_of::<u16>(),
+        );
+        let rc = RegSetValueExW(key, name.as_ptr(), 0, REG_SZ, bytes.as_ptr(), bytes.len() as u32);
+        RegCloseKey(key);
+        if rc != 0 {
+            return Err(format!("写入自启项失败（{rc}），可能被安全软件拦截"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn delete_run_value() -> Result<(), String> {
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
+    };
+    unsafe {
+        let mut key: HKEY = std::ptr::null_mut();
+        let path = super::wide(RUN_KEY);
+        let rc = RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_SET_VALUE, &mut key);
+        if rc == ERROR_FILE_NOT_FOUND {
+            return Ok(());
+        }
+        if rc != 0 {
+            return Err(format!("打开注册表失败（{rc}）"));
+        }
+        let name = super::wide(RUN_VALUE);
+        let rc = RegDeleteValueW(key, name.as_ptr());
+        RegCloseKey(key);
+        if rc == 0 || rc == ERROR_FILE_NOT_FOUND { Ok(()) } else { Err(format!("删除自启项失败（{rc}）")) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +450,18 @@ mod tests {
         let xml = task_xml(r"C:\a&b\c.exe", "u<ser");
         assert!(xml.contains("a&amp;b"));
         assert!(xml.contains("u&lt;ser"));
+    }
+
+    #[test]
+    fn path_matching_handles_run_value_with_args() {
+        assert!(path_matches(
+            r#""C:\Program Files\MemCleaner\MemCleaner.exe" --autostart"#,
+            r"C:\Program Files\MemCleaner\MemCleaner.exe"
+        ));
+        assert!(path_matches(
+            r"C:\Tools\MemCleaner.exe --autostart",
+            r"c:\tools\memcleaner.exe"
+        ));
     }
 
     #[test]

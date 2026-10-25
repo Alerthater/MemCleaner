@@ -73,3 +73,18 @@
   删除任务后以管理员启动程序可自动重建；`schtasks /Run` 能启动 `--autostart` 且窗口隐藏驻留托盘；
   真实用户会话（UAC 启动的管理员实例）托盘注册 `tray add ok=true`。
 - 本地内测报告：`docs/verify/autostart-fix.md`（含诊断日志与截图路径）。
+
+## 8. v1.2.0 根因记录：「自动清理一直失败」= 程序目录被标记为 Low 完整性
+
+- 现象：开机自启后程序窗口出现，但自动清理每秒失败（`STATUS_PRIVILEGE_NOT_HELD 0xC0000061`），
+  托盘图标注册失败（`Shell_NotifyIcon` 返回 ERROR_ACCESS_DENIED），配置写入回退到程序目录。
+- 诊断：程序以 `--autostart` 启动时，令牌为 **High 提权标志但完整性 = Low（S-1-16-4096）**；
+  对比 `cmd.exe`（同任务）为 Medium。`icacls 程序所在目录` 显示
+  `Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)`——目录被开发/沙箱工具打上 Low 标签，
+  Windows 会把从该目录启动的进程降权。
+- 修复：v1.2.0 把程序迁移到普通目录（`%LOCALAPPDATA%\MemCleaner\`）；
+  自启改为用户级 HKCU Run（普通权限，托盘/配置正常）；
+  自动清理增加失败退避/暂停、权限能力检测、受限令牌守卫与诊断日志；
+  受限 `--autostart` 实例会立即退出，不再抢占单实例。
+- 验证：普通上下文（Medium）启动日志：`write_profile=OK`、`tray add ok=true`、
+  `autostart status: Installed`、`auto clean skipped (not capable): 需要管理员权限` 且只提示一次。

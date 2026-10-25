@@ -143,6 +143,16 @@ pub fn is_elevated() -> bool {
     privilege::is_elevated()
 }
 
+/// 当前进程令牌完整性级别 RID（0x2000=Medium、0x3000=High、0x1000=Low）。
+pub fn integrity_rid() -> u32 {
+    privilege::integrity_rid()
+}
+
+/// 当前进程能否静默执行系统级清理（管理员 + High 完整性 + 可启用特权）。
+pub fn can_clean_silently() -> Result<(), String> {
+    privilege::can_clean_silently()
+}
+
 /// 执行一次清理（阻塞，须在工作线程调用）。
 pub fn clean(opts: &CleanOptions) -> Result<CleanOutcome, CleanError> {
     engine_clean(opts)
