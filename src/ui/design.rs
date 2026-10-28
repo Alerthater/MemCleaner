@@ -743,10 +743,12 @@ pub(crate) fn settings_row_text(tab: SettingsTab, n: i32, st: &UiState) -> (&'st
         ),
         (SettingsTab::General, 8) => (
             "开机自启",
-            if cfg.autostart_installed {
-                "已安装管理员计划任务".to_string()
+            if cfg.autostart_installed && cfg.autostart_elevated {
+                "已安装管理员计划任务（登录静默启动）".to_string()
+            } else if cfg.autostart_installed {
+                "普通权限自启：点开关可升级为管理员".to_string()
             } else {
-                "需要管理员权限".to_string()
+                "需要管理员权限（点开关时 UAC 授权）".to_string()
             },
         ),
         (SettingsTab::General, 9) => (

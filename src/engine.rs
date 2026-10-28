@@ -23,6 +23,17 @@ pub fn options_from_config(cfg: &Config) -> CleanOptions {
     }
 }
 
+/// 自动清理使用的选项（v1.3.0）。
+///
+/// 自动清理会跳过「收缩文件缓存」：`SetSystemFileCacheSize` 在大量文件缓存时
+/// 可能阻塞数秒磁盘 IO，每隔几分钟自动执行一次会明显拖慢正在使用的系统。
+/// 该项保留给手动清理（用户主动点击时对可感知的短暂停顿接受度更高）。
+pub fn auto_options_from_config(cfg: &Config) -> CleanOptions {
+    let mut opts = options_from_config(cfg);
+    opts.trim_file_cache = false;
+    opts
+}
+
 /// 执行一次清理。**阻塞调用，请放在工作线程里。**
 ///
 /// 顺序与 PCL 一致：先测可用内存 → 启用特权 → 2/3/4 →（可选 5、文件缓存）→ 再测可用内存。
@@ -170,6 +181,10 @@ mod tests {
         assert!(o.empty_working_sets);
         assert!(!o.purge_standby);
         assert!(o.trim_file_cache);
+        // 自动清理不收缩文件缓存（避免自动执行时的长 IO 停顿）。
+        let a = auto_options_from_config(&cfg);
+        assert!(a.empty_working_sets);
+        assert!(!a.trim_file_cache);
     }
 
     #[test]

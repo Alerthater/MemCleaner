@@ -110,6 +110,8 @@ pub struct SettingsSnapshot {
     pub start_with_windows: bool,
     pub theme: ThemeMode,
     pub autostart_installed: bool,
+    /// 自启是否为「最高权限计划任务」（登录后管理员权限静默启动）。
+    pub autostart_elevated: bool,
     /// 托盘图标是否直接显示内存占用率。
     pub tray_show_percent: bool,
     /// 配色方案。
@@ -221,6 +223,7 @@ impl UiState {
                 start_with_windows: false,
                 theme: ThemeMode::System,
                 autostart_installed: false,
+                autostart_elevated: false,
                 tray_show_percent: true,
                 accent: AccentScheme::Blue,
                 skin_preset: SkinPreset::Default,

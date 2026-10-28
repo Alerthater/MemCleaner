@@ -55,11 +55,17 @@ fn main() {
             println!("{line}");
         }
         match st {
-            platform::autostart::AutostartStatus::Installed => println!("status=installed"),
+            platform::autostart::AutostartStatus::InstalledTask => {
+                println!("status=installed-task (登录后管理员权限静默启动)")
+            }
+            platform::autostart::AutostartStatus::InstalledRun(cmd) => {
+                println!("status=installed-run (v1.2.0 遗留普通权限自启，需管理员实例升级)");
+                println!("run_value={cmd}");
+            }
             platform::autostart::AutostartStatus::NotInstalled => println!("status=not-installed"),
             platform::autostart::AutostartStatus::Mismatched(cmd) => {
                 println!("status=mismatched");
-                println!("run_value={cmd}");
+                println!("autostart_target={cmd}");
             }
             platform::autostart::AutostartStatus::Error(e) => {
                 println!("status=error");
@@ -69,7 +75,8 @@ fn main() {
         if let Some(cmd) = platform::autostart::user_autostart_command() {
             println!("run_value={cmd}");
         }
-        println!("old_task_exists={}", platform::autostart::old_task_exists());
+        println!("task_command={:?}", platform::autostart::task_command());
+        println!("task_exists={}", platform::autostart::task_exists());
         std::process::exit(0);
     }
     // 无界面维护模式：安装 / 卸载开机自启计划任务（需要管理员权限）。
@@ -111,6 +118,12 @@ fn main() {
             app::diag_log(&format!(
                 "autostart instance has restricted token (integrity 0x{rid:04X}); exit"
             ));
+            return;
+        }
+        // v1.3.0：管理员计划任务已安装时，v1.2.0 遗留的 Run 项（普通权限）直接让位，
+        // 避免普通权限实例抢先占用单实例，导致真正的管理员任务实例被唤醒后退出。
+        if !sys::is_elevated() && platform::autostart::task_exists() {
+            app::diag_log("medium autostart instance yields to elevated scheduled task; exit");
             return;
         }
     }

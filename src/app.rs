@@ -64,6 +64,8 @@ pub struct App {
 
     // 清理
     cleaning: bool,
+    /// 当前这次清理是否由「自动清理」触发（决定是否收缩文件缓存、低收益退避等）。
+    cleaning_auto: bool,
     clean_started: Instant,
     clean_rx: Option<mpsc::Receiver<Result<CleanOutcome, CleanError>>>,
     last_freed: u64,
@@ -92,6 +94,8 @@ pub struct App {
 
     // 状态
     autostart_installed: bool,
+    /// 自启是否以「最高权限计划任务」实现（登录后管理员权限静默启动）。
+    autostart_elevated: bool,
     /// 自动清理失败后的重试时间点（退避，避免每秒重试刷屏）。
     auto_retry_at: Option<Instant>,
     /// 连续失败次数。
@@ -189,6 +193,7 @@ impl App {
             clean_progress: 0.0,
             clean_flash_until: None,
             cleaning: false,
+            cleaning_auto: false,
             clean_started: Instant::now(),
             clean_rx: None,
             last_freed: 0,
@@ -206,6 +211,7 @@ impl App {
             toast_born: None,
             confirm: None,
             autostart_installed: false,
+            autostart_elevated: false,
             auto_retry_at: None,
             auto_fail_count: 0,
             auto_pause_reason: None,
@@ -385,8 +391,11 @@ impl App {
                 window::invalidate(self.hwnd);
             }
         }
-        // 清理兜底（防止工作线程异常丢失通知）
-        if self.cleaning && self.clean_started.elapsed() > Duration::from_secs(10) {
+        // 清理兜底（防止工作线程异常丢失通知）。
+        // v1.3.0：手动清理可能因收缩文件缓存而 IO 阻塞数秒，超时上限放宽到 60s；
+        // 超时后立刻丢弃接收端，避免「超时失败」与稍后到达的成功结果重复提示。
+        if self.cleaning && self.clean_started.elapsed() > Duration::from_secs(60) {
+            self.clean_rx = None;
             self.finish_clean_with_error(CleanError::Os("清理超时".to_string()));
         }
         if self.visible {
@@ -501,6 +510,7 @@ impl App {
                 start_with_windows: self.cfg.start_with_windows,
                 theme: self.cfg.theme,
                 autostart_installed: self.autostart_installed,
+                autostart_elevated: self.autostart_elevated,
                 tray_show_percent: self.cfg.tray_show_percent,
                 accent: self.cfg.accent,
                 skin_preset: self.cfg.skin_preset,
@@ -718,10 +728,9 @@ impl App {
                         let _ = self.relaunch_elevated("");
                     }
                     Some(ConfirmKind::ElevateAutostart) => {
-                        self.cfg.start_with_windows = !self.cfg.start_with_windows;
-                        self.save_config();
+                        // toggle_autostart 已经把开关改到目标状态并保存；这里只需提权应用。
+                        // UAC 被取消：回滚配置，避免「开关显示已开但任务不存在」。
                         if !self.relaunch_elevated("--apply-autostart") {
-                            // UAC 被取消：回滚配置，避免「开关显示已开但计划任务不存在」
                             self.cfg.start_with_windows = !self.cfg.start_with_windows;
                             self.save_config();
                         }
@@ -730,6 +739,11 @@ impl App {
                 }
             }
             Action::ConfirmCancel => {
+                // 取消「提权安装自启」时回滚开关，避免界面显示已开而任务不存在。
+                if matches!(self.confirm, Some(ConfirmKind::ElevateAutostart)) {
+                    self.cfg.start_with_windows = !self.cfg.start_with_windows;
+                    self.save_config();
+                }
                 self.confirm = None;
                 window::invalidate(self.hwnd);
             }
@@ -861,9 +875,16 @@ impl App {
     }
 
     fn toggle_autostart(&mut self) {
-        // v1.2.0：用户级 Run 键自启，不需要管理员权限，也不弹 UAC。
+        // v1.3.0：开机自启必须是「最高权限计划任务」，否则登录后没有管理员权限、无法自动清理。
+        // 普通权限实例先记录用户的意图，再引导一次 UAC 提权，由管理员实例真正安装。
         self.cfg.start_with_windows = !self.cfg.start_with_windows;
-        self.apply_autostart_setting();
+        self.save_config();
+        if self.elevated {
+            self.apply_autostart_setting();
+            return;
+        }
+        self.confirm = Some(ConfirmKind::ElevateAutostart);
+        window::invalidate(self.hwnd);
     }
 
     fn apply_autostart_setting(&mut self) {
@@ -875,9 +896,15 @@ impl App {
         };
         match result {
             Ok(()) => {
-                self.autostart_installed = self.cfg.start_with_windows;
+                let status = autostart::status_for(&exe);
+                self.autostart_installed = status.is_installed();
+                self.autostart_elevated = status.is_elevated();
                 let text = if self.cfg.start_with_windows {
-                    "开机自启已启用（登录后自动驻留托盘）"
+                    if self.autostart_elevated {
+                        "开机自启已启用（登录后管理员权限静默驻留）"
+                    } else {
+                        "开机自启已启用（普通权限，自动清理需管理员）"
+                    }
                 } else {
                     "开机自启已关闭"
                 };
@@ -890,13 +917,15 @@ impl App {
             }
         }
         window::invalidate(self.hwnd);
+        self.request_animation();
     }
 
-    /// 同步并修复用户级开机自启（v1.2.0）。
+    /// 同步并修复开机自启状态（v1.3.0：最高权限计划任务）。
     ///
-    /// - 配置为开但注册表项缺失/指向旧路径 → 自动重建（普通权限即可）；
-    /// - 配置为关但注册表项存在 → 删除；
-    /// - 管理员实例下顺带删除 v1.1.x 的旧最高权限任务（它会被系统以受限令牌启动）。
+    /// - 配置为开但任务缺失/指向旧路径 → 管理员实例自动重建；
+    /// - 配置为开但仍是 v1.2.0 的 Run 键 → 管理员实例自动升级为计划任务；
+    /// - 配置为关但任务存在 → 管理员实例删除；
+    /// - 普通权限实例只做状态显示，不写任务（会在用户点开关时引导 UAC）。
     fn refresh_autostart_state(&mut self, notify: bool) {
         let exe = elevate::current_exe();
         let status = autostart::status_for(&exe);
@@ -905,36 +934,80 @@ impl App {
             self.cfg.start_with_windows, self.elevated
         ));
         match status {
-            autostart::AutostartStatus::Installed => {
+            autostart::AutostartStatus::InstalledTask => {
                 self.autostart_installed = true;
+                self.autostart_elevated = true;
                 if !self.cfg.start_with_windows {
-                    match autostart::uninstall() {
-                        Ok(()) => {
-                            self.autostart_installed = false;
-                            diag_log("autostart: removed because config is off");
+                    if self.elevated {
+                        match autostart::uninstall() {
+                            Ok(()) => {
+                                self.autostart_installed = false;
+                                self.autostart_elevated = false;
+                                diag_log("autostart: removed because config is off");
+                            }
+                            Err(e) => diag_log(&format!("autostart uninstall failed: {e}")),
                         }
-                        Err(e) => diag_log(&format!("autostart uninstall failed: {e}")),
+                    } else {
+                        diag_log("autostart: config off but task exists; needs admin to remove");
+                    }
+                }
+            }
+            autostart::AutostartStatus::InstalledRun(cmd) => {
+                // v1.2.0 遗留：Run 键能以普通权限启动，无法自动清理，升级为计划任务。
+                self.autostart_installed = true;
+                self.autostart_elevated = false;
+                diag_log(&format!("autostart: legacy Run value found: {cmd}"));
+                if self.elevated {
+                    if self.cfg.start_with_windows {
+                        match autostart::install(&exe) {
+                            Ok(()) => {
+                                self.autostart_elevated = true;
+                                diag_log("autostart: upgraded legacy Run value to elevated task");
+                                if notify && self.visible {
+                                    self.show_toast("已升级为管理员自启", ToastKind::Success);
+                                }
+                            }
+                            Err(e) => {
+                                diag_log(&format!("autostart upgrade failed: {e}"));
+                                if notify && self.visible {
+                                    self.show_toast(&format!("开机自启升级失败：{e}"), ToastKind::Error);
+                                }
+                            }
+                        }
+                    } else if let Err(e) = autostart::uninstall() {
+                        diag_log(&format!("autostart remove legacy run failed: {e}"));
+                    } else {
+                        self.autostart_installed = false;
                     }
                 }
             }
             autostart::AutostartStatus::NotInstalled
             | autostart::AutostartStatus::Mismatched(_) => {
                 self.autostart_installed = false;
+                self.autostart_elevated = false;
                 if self.cfg.start_with_windows {
-                    match autostart::install(&exe) {
-                        Ok(()) => {
-                            self.autostart_installed = true;
-                            diag_log("autostart: repaired/reinstalled (user Run key)");
-                            if notify && self.visible {
-                                self.show_toast("已自动修复开机自启", ToastKind::Success);
+                    if self.elevated {
+                        match autostart::install(&exe) {
+                            Ok(()) => {
+                                self.autostart_installed = true;
+                                self.autostart_elevated = true;
+                                diag_log("autostart: repaired/reinstalled as elevated task");
+                                if notify && self.visible {
+                                    self.show_toast("已自动修复开机自启", ToastKind::Success);
+                                }
+                            }
+                            Err(e) => {
+                                diag_log(&format!("autostart repair failed: {e}"));
+                                if notify && self.visible {
+                                    self.show_toast(
+                                        &format!("开机自启修复失败：{e}"),
+                                        ToastKind::Error,
+                                    );
+                                }
                             }
                         }
-                        Err(e) => {
-                            diag_log(&format!("autostart repair failed: {e}"));
-                            if notify && self.visible {
-                                self.show_toast(&format!("开机自启修复失败：{e}"), ToastKind::Error);
-                            }
-                        }
+                    } else {
+                        diag_log("autostart: config on but current process is not elevated");
                     }
                 }
             }
@@ -943,13 +1016,6 @@ impl App {
                 if notify && self.visible {
                     self.show_toast(&format!("开机自启状态查询失败：{e}"), ToastKind::Error);
                 }
-            }
-        }
-        // 迁移：删除 v1.1.x 的最高权限计划任务（需要管理员；删不掉也不影响，--autostart 会自检退出）。
-        if self.elevated && autostart::old_task_exists() {
-            match autostart::uninstall_old_task() {
-                Ok(()) => diag_log("autostart: old elevated task removed"),
-                Err(e) => diag_log(&format!("autostart: remove old task failed: {e}")),
             }
         }
         window::invalidate(self.hwnd);
@@ -1110,22 +1176,43 @@ impl App {
     // 清理流程
     // ------------------------------------------------------------------
 
+    /// 手动清理（用户点击按钮 / 托盘菜单「立即清理」）。
     fn start_clean(&mut self) {
+        self.start_clean_inner(false);
+    }
+
+    /// 自动清理（由阈值触发）：跳过收缩文件缓存，避免每次自动清理都产生长磁盘 IO 停顿。
+    fn start_clean_auto(&mut self) {
+        self.start_clean_inner(true);
+    }
+
+    fn start_clean_inner(&mut self, auto: bool) {
         if self.cleaning {
-            self.show_toast("正在清理，请稍候…", ToastKind::Info);
+            if !auto {
+                self.show_toast("正在清理，请稍候…", ToastKind::Info);
+            }
             return;
         }
         if !self.cfg.has_any_item() {
-            self.show_toast("请先在设置中选择至少一个清理项", ToastKind::Error);
+            if !auto {
+                self.show_toast("请先在设置中选择至少一个清理项", ToastKind::Error);
+            }
             return;
         }
         if let Err(reason) = sys::can_clean_silently() {
             diag_log(&format!("clean unavailable in current process: {reason}"));
+            if auto {
+                return;
+            }
             self.confirm = Some(ConfirmKind::ElevateClean);
             window::invalidate(self.hwnd);
             return;
         }
-        let opts = engine::options_from_config(&self.cfg);
+        let opts = if auto {
+            engine::auto_options_from_config(&self.cfg)
+        } else {
+            engine::options_from_config(&self.cfg)
+        };
         let (tx, rx) = mpsc::channel();
         let hwnd_val = self.hwnd as isize;
         std::thread::spawn(move || {
@@ -1137,6 +1224,11 @@ impl App {
         });
         self.clean_rx = Some(rx);
         self.cleaning = true;
+        self.cleaning_auto = auto;
+        diag_log(&format!(
+            "clean start auto={auto} trim_cache={}",
+            opts.trim_file_cache
+        ));
         self.clean_started = Instant::now();
         self.clean_progress = 0.0;
         self.request_animation();
@@ -1168,7 +1260,9 @@ impl App {
     }
 
     fn finish_clean_success(&mut self, outcome: CleanOutcome) {
+        let was_auto = self.cleaning_auto;
         self.cleaning = false;
+        self.cleaning_auto = false;
         self.auto_fail_count = 0;
         self.auto_retry_at = None;
         self.auto_pause_reason = None;
@@ -1195,6 +1289,14 @@ impl App {
             "已优化到最佳状态".to_string()
         };
         self.show_toast(&text, ToastKind::Success);
+        // 自动清理「低收益」退避：如果刚清理完很快又到阈值，说明系统正在大量申请内存，
+        // 连续清理只会反复打断用户（且每次清理本身就有 IO 成本），先让系统自然稳定 5 分钟。
+        if was_auto && reported < 128 * 1024 * 1024 {
+            self.auto_retry_at = Some(Instant::now() + Duration::from_secs(300));
+            diag_log(&format!(
+                "auto clean low yield ({reported} bytes): next auto check in 300s"
+            ));
+        }
         self.update_tray();
         diag_log(&format!(
             "clean ok freed={} reclaimed={} bytes before={} after={} duration={}ms steps={:?}",
@@ -1215,6 +1317,7 @@ impl App {
 
     fn finish_clean_with_error(&mut self, err: CleanError) {
         self.cleaning = false;
+        self.cleaning_auto = false;
         self.clean_progress = 0.0;
         let text = if matches!(err, CleanError::NotElevated) {
             "清理失败：请以管理员身份运行".to_string()
@@ -1279,7 +1382,7 @@ impl App {
             "auto clean trigger: usage={}% threshold={}% since={since:?}s",
             self.status.percent, self.cfg.auto_threshold_percent
         ));
-        self.start_clean();
+        self.start_clean_auto();
     }
 
     // ------------------------------------------------------------------

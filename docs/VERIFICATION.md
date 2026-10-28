@@ -88,3 +88,24 @@
   受限 `--autostart` 实例会立即退出，不再抢占单实例。
 - 验证：普通上下文（Medium）启动日志：`write_profile=OK`、`tray add ok=true`、
   `autostart status: Installed`、`auto clean skipped (not capable): 需要管理员权限` 且只提示一次。
+
+## 9. v1.3.0 验证：最高权限自启 + 自动清理降频（2026-10-28）
+
+- 被测程序：`C:\Users\admin\AppData\Local\MemCleaner\MemCleaner.exe`（v1.3.0，
+  SHA256 `D01C5100EFE3ADFA3BA4570375A64ACC869452B2E83629695319CEAF2064503A`）；
+  源码位于普通目录，无 Low 完整性标签。
+- 计划任务：`MemCleaner AutoStart`，`LogonTrigger + RunLevel=HighestAvailable + Enabled`，
+  `<Command>` 为无引号绝对路径；用 `schtasks /Run` 触发后日志为
+  `launch args=["--autostart"]`、`diag integrity=High(0x3000)`、`elevated=true`，
+  `tray add ok=true err=0`，`autostart status: InstalledTask config_on=true elevated=true`。
+- 自启安装/卸载幂等：管理员 `--uninstall-autostart` → `status=not-installed, task_exists=false`；
+  `--install-autostart` → `status=installed-task`，`task_command` 指向当前 exe，旧 HKCU Run 值已删除。
+- 自动清理（临时把阈值调为 30% 触发一次后已恢复用户配置 60%）：
+  `auto clean trigger: usage=54% threshold=30% since=Some(483s)` →
+  `clean start auto=true trim_cache=false` →
+  `clean ok ... duration=10837ms steps=[("EmptyWorkingSets", true, None), ("FlushModifiedList", true, None),
+  ("PurgeStandbyList", true, None), ("PurgeLowPriorityStandbyList", true, None)]`（4 步，无 TrimFileCache，
+  未出现超时误报；旧版 10 秒超时会在这条成功的清理上误报失败）。
+- 单元测试：`cargo test --release` **46 passed / 0 failed**。
+- 用户配置已恢复：`auto_threshold_percent=60`、`auto_cooldown_seconds=300`；验证后程序以计划任务方式
+  在托盘驻留（管理员权限）。

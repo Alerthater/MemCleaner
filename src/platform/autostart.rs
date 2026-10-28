@@ -1,15 +1,19 @@
-//! 开机自启：通过「计划任务（最高权限）」实现静默自启，避免每次开机 UAC。
+//! 开机自启：通过「计划任务（最高权限）」实现登录时静默以管理员权限启动。
 //!
-//! 为什么不用注册表 Run：注册表自启只能以普通权限运行，而内存清理必须管理员权限。
-//! 计划任务以 HighestAvailable 运行，登录时静默启动到托盘。
+//! ## 为什么必须是计划任务（v1.3.0 结论）
 //!
-//! v1.1.1 加固：
-//! - `<Command>` 不再对含空格路径加引号（Task Scheduler 的 Command 是路径文本，
-//!   加引号会导致任务启动失败）；
-//! - `status_for()` 会读取任务 XML，校验任务指向的 exe 路径是否与当前进程一致，
-//!   用于「任务缺失/指向旧路径」时自动修复；
-//! - `uninstall()` 幂等：任务本来不存在时也视为成功；
-//! - `install()` 创建后立即回读校验，失败返回可读错误。
+//! 注册表 `HKCU\...\Run` 只能以普通权限启动进程，而内存清理必须管理员权限。
+//! v1.2.0 曾改回 Run 键，导致「开机自启后清理提示需要管理员」——m00645 用户反馈。
+//! 因此 v1.3.0 恢复计划任务作为唯一自启方式：
+//! - `RunLevel=HighestAvailable` + `LogonType=InteractiveToken`：登录时由任务计划程序
+//!   直接以管理员令牌启动（High 完整性），不弹 UAC，能直接清理内存；
+//! - 安装/卸载任务需要管理员权限，普通权限下由界面引导用户 UAC 提权后再写。
+//!
+//! v1.1.1 的经验继续保留：
+//! - `<Command>` 不加引号（Task Scheduler 的 Command 是路径文本）；
+//! - 安装后回读 XML 校验路径，失败返回可读错误；
+//! - 卸载幂等（任务/注册表项不存在也视为成功）；
+//! - 顺带清掉 v1.2.0 遗留的 Run 键，避免任务 + Run 双启动。
 
 use std::process::Command;
 
@@ -25,9 +29,12 @@ pub const TASK_NAME: &str = "MemCleaner AutoStart";
 /// 自启状态。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AutostartStatus {
-    Installed,
+    /// 最高权限计划任务已安装且指向当前 exe：登录后管理员权限静默启动。
+    InstalledTask,
+    /// 仅存在 v1.2.0 用户级 Run 项（普通权限启动；清理时仍需手动提权）。
+    InstalledRun(String),
     NotInstalled,
-    /// 任务存在，但指向的 exe 路径与当前程序不一致（例如程序被移动过）。
+    /// 存在自启项但指向的 exe 路径与当前程序不一致（例如程序被移动过）。
     Mismatched(String),
     /// 查询失败（计划任务服务异常等）。
     Error(String),
@@ -35,27 +42,46 @@ pub enum AutostartStatus {
 
 impl AutostartStatus {
     pub fn is_installed(&self) -> bool {
-        matches!(self, AutostartStatus::Installed)
+        matches!(
+            self,
+            AutostartStatus::InstalledTask | AutostartStatus::InstalledRun(_)
+        )
+    }
+
+    /// 是否已实现「管理员权限静默自启」。
+    pub fn is_elevated(&self) -> bool {
+        matches!(self, AutostartStatus::InstalledTask)
     }
 }
 
-/// 查询计划任务是否存在（不校验路径）。
-/// 查询用户级自启状态（不校验路径）。
+/// 查询当前 exe 的自启状态。
 pub fn status() -> AutostartStatus {
-    match read_run_value() {
-        Ok(Some(_)) => AutostartStatus::Installed,
-        Ok(None) => AutostartStatus::NotInstalled,
-        Err(e) => AutostartStatus::Error(e),
-    }
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    status_for(&exe)
 }
 
-/// 查询任务并校验它指向的 exe 是否就是 `exe_path`。
-/// 查询用户级自启是否指向 `exe_path`。
+/// 查询计划任务并校验它指向的 exe 是否就是 `exe_path`。
 pub fn status_for(exe_path: &str) -> AutostartStatus {
+    match task_command() {
+        Some(cmd) => {
+            if path_matches(&cmd, exe_path) {
+                return AutostartStatus::InstalledTask;
+            }
+            return AutostartStatus::Mismatched(cmd);
+        }
+        None => {
+            if task_exists_unknown() {
+                // 任务存在但读不到 XML：无法确认路径，按未安装处理并由安装流程覆盖。
+                return AutostartStatus::Mismatched(String::new());
+            }
+        }
+    }
     match read_run_value() {
         Ok(Some(value)) => {
             if path_matches(&value, exe_path) {
-                AutostartStatus::Installed
+                AutostartStatus::InstalledRun(value)
             } else {
                 AutostartStatus::Mismatched(value)
             }
@@ -67,6 +93,12 @@ pub fn status_for(exe_path: &str) -> AutostartStatus {
 
 /// 读取计划任务 XML 里的 `<Command>` 内容；任务不存在/查询失败返回 None。
 pub fn task_command() -> Option<String> {
+    let xml = query_task_xml()?;
+    extract_xml_tag(&xml, "Command").map(|s| xml_unescape(s.trim()))
+}
+
+/// 查询任务的完整 XML。
+fn query_task_xml() -> Option<String> {
     let mut cmd = Command::new("schtasks.exe");
     cmd.args(["/Query", "/TN", TASK_NAME, "/XML"]);
     #[cfg(windows)]
@@ -75,46 +107,107 @@ pub fn task_command() -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    // schtasks 输出为系统 ANSI/UTF-8 混合，这里按 Windows 中文环境常见的 GBK 优先尝试。
-    let text = decode_console(&out.stdout);
-    extract_xml_tag(&text, "Command").map(|s| xml_unescape(s.trim()))
+    Some(decode_console(&out.stdout))
 }
 
-/// 安装（或更新）自启计划任务。需要管理员权限。
+/// 计划任务是否存在（不校验路径）。
+pub fn task_exists() -> bool {
+    run_schtasks(&["/Query", "/TN", TASK_NAME]).unwrap_or(false)
+}
+
+/// 任务存在但 XML 读不出来的兜底判断。
+fn task_exists_unknown() -> bool {
+    task_exists()
+}
+
+/// 安装（或更新）开机自启计划任务。需要管理员权限。
 ///
-/// 创建后会回读任务 XML 校验路径；失败时返回可读错误。
-/// 安装用户级自启（HKCU Run，不需要管理员），并清理旧版计划任务。
+/// 创建后会回读任务 XML 校验路径；成功时删除 v1.2.0 遗留的 Run 键。
 pub fn install(exe_path: &str) -> Result<(), String> {
     if exe_path.trim().is_empty() {
         return Err("程序路径为空".to_string());
     }
-    let command = format!("\"{}\" --autostart", exe_path.trim());
-    write_run_value(&command)?;
-    match read_run_value() {
-        Ok(Some(v)) if v == command => {}
-        Ok(Some(v)) => return Err(format!("开机自启写入后不一致：{v}")),
-        Ok(None) => return Err("开机自启写入后查询不到（可能被安全软件拦截）".to_string()),
+    if !crate::sys::is_elevated() {
+        return Err("安装管理员自启需要管理员权限：请先以管理员身份运行本程序".to_string());
+    }
+    install_task(exe_path)?;
+    if let Err(e) = delete_run_value() {
+        // Run 键删不掉不影响任务模式，但记录到诊断日志。
+        crate::app::diag_log(&format!("autostart: cleanup run value failed: {e}"));
+    }
+    let _ = uninstall_clean_task();
+    Ok(())
+}
+
+/// 卸载开机自启：删除计划任务与 v1.2.0 遗留 Run 键。需要管理员权限（任务部分）。
+///
+/// 任务不存在时视为成功（幂等）。
+pub fn uninstall() -> Result<(), String> {
+    if crate::sys::is_elevated() {
+        uninstall_task()?;
+        delete_run_value()?;
+        let _ = uninstall_clean_task();
+        Ok(())
+    } else {
+        delete_run_value()?;
+        if task_exists() {
+            Err("移除管理员自启任务需要管理员权限：请先以管理员身份运行本程序".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// 创建计划任务（要求调用方已提权）。
+fn install_task(exe_path: &str) -> Result<(), String> {
+    let user = current_user_id();
+    let xml = task_xml(exe_path, &user);
+    let path = write_task_xml(&xml)?;
+    let path_str = path.to_string_lossy().to_string();
+    let result = run_schtasks(&["/Create", "/TN", TASK_NAME, "/XML", &path_str, "/F"]);
+    let _ = std::fs::remove_file(&path);
+    match result {
+        Ok(true) => {}
+        Ok(false) => return Err("创建自启计划任务失败（schtasks 返回错误）".to_string()),
         Err(e) => return Err(e),
     }
-    if crate::sys::is_elevated() {
-        let _ = uninstall_old_task();
-        let _ = uninstall_clean_task();
+    // 回读校验：任务必须存在且指向当前 exe。
+    match task_command() {
+        Some(cmd) if path_matches(&cmd, exe_path) => Ok(()),
+        Some(cmd) => Err(format!("计划任务指向的路径不一致：{cmd}")),
+        None => Err("计划任务创建后查询不到（可能被杀毒软件拦截）".to_string()),
     }
-    Ok(())
 }
 
-/// 卸载自启计划任务。需要管理员权限；任务不存在时视为成功（幂等）。
-/// 卸载用户级自启（HKCU Run，幂等），并清理旧版计划任务。
-pub fn uninstall() -> Result<(), String> {
-    delete_run_value()?;
-    if crate::sys::is_elevated() {
-        let _ = uninstall_old_task();
-        let _ = uninstall_clean_task();
+/// 把任务 XML 写到临时文件（UTF-16LE + BOM，`schtasks /XML` 要求）。
+fn write_task_xml(xml: &str) -> Result<std::path::PathBuf, String> {
+    let mut path = std::env::temp_dir();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    path.push(format!("memcleaner-task-{unique}.xml"));
+    let mut data: Vec<u8> = vec![0xFF, 0xFE];
+    for unit in xml.encode_utf16() {
+        data.extend_from_slice(&unit.to_le_bytes());
     }
-    Ok(())
+    std::fs::write(&path, data).map_err(|e| format!("写入任务定义失败：{e}"))?;
+    Ok(path)
 }
 
-/// 启动一个计划任务（用于自检/验证）。需要管理员权限。
+/// 删除计划任务（幂等；要求调用方已提权）。
+fn uninstall_task() -> Result<(), String> {
+    if run_schtasks(&["/Delete", "/TN", TASK_NAME, "/F"]).unwrap_or(false) {
+        return Ok(());
+    }
+    if task_exists() {
+        Err("删除自启计划任务失败（权限不足）".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// 启动计划任务（用于验证）。需要管理员权限。
 pub fn run_task() -> Result<(), String> {
     if run_schtasks(&["/Run", "/TN", TASK_NAME])? {
         Ok(())
@@ -152,7 +245,7 @@ pub fn path_matches(run_value: &str, exe_path: &str) -> bool {
         || normalize_path(run_value) == normalize_path(exe_path)
 }
 
-/// 从「"C:\path\app.exe" --args」里取出 exe 路径。
+/// 从「"C:\\path\\app.exe" --args」里取出 exe 路径。
 fn extract_exe_path(s: &str) -> &str {
     let t = s.trim();
     if let Some(rest) = t.strip_prefix('"') {
@@ -287,38 +380,23 @@ fn xml_escape(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// 用户级自启（HKCU\Software\Microsoft\Windows\CurrentVersion\Run）
+// v1.2.0 遗留的用户级自启（HKCU\Software\Microsoft\Windows\CurrentVersion\Run）
+//
+// v1.3.0 起只用于迁移清理与诊断，不再作为安装入口。
 // ---------------------------------------------------------------------------
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "MemCleaner";
 
-/// 读取用户级自启命令行。
+/// 读取用户级自启命令行（诊断/迁移用）。
 pub fn user_autostart_command() -> Option<String> {
     read_run_value().ok().flatten()
-}
-
-/// 删除旧版计划任务 `MemCleaner AutoStart`（需管理员，幂等）。
-pub fn uninstall_old_task() -> Result<(), String> {
-    if run_schtasks(&["/Delete", "/TN", TASK_NAME, "/F"]).unwrap_or(false) {
-        return Ok(());
-    }
-    if run_schtasks(&["/Query", "/TN", TASK_NAME]).unwrap_or(false) {
-        Err("删除旧版计划任务失败（权限不足）".to_string())
-    } else {
-        Ok(())
-    }
 }
 
 /// 清理 v1.1.1 可能存在的清理任务（幂等）。
 pub fn uninstall_clean_task() -> Result<(), String> {
     let _ = run_schtasks(&["/Delete", "/TN", "MemCleaner Clean", "/F"]);
     Ok(())
-}
-
-/// 旧版计划任务是否存在（迁移/诊断用）。
-pub fn old_task_exists() -> bool {
-    run_schtasks(&["/Query", "/TN", TASK_NAME]).unwrap_or(false)
 }
 
 #[cfg(windows)]
@@ -374,38 +452,6 @@ fn read_run_value() -> Result<Option<String>, String> {
 }
 
 #[cfg(windows)]
-fn write_run_value(value: &str) -> Result<(), String> {
-    use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
-        REG_OPTION_NON_VOLATILE, REG_SZ,
-    };
-    unsafe {
-        let mut key: HKEY = std::ptr::null_mut();
-        let path = super::wide(RUN_KEY);
-        let mut disposition = 0u32;
-        let rc = RegCreateKeyExW(
-            HKEY_CURRENT_USER, path.as_ptr(), 0, std::ptr::null_mut(),
-            REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, std::ptr::null_mut(), &mut key, &mut disposition,
-        );
-        if rc != 0 {
-            return Err(format!("打开注册表失败（{rc}）"));
-        }
-        let name = super::wide(RUN_VALUE);
-        let data: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
-        let bytes = std::slice::from_raw_parts(
-            data.as_ptr() as *const u8,
-            data.len() * std::mem::size_of::<u16>(),
-        );
-        let rc = RegSetValueExW(key, name.as_ptr(), 0, REG_SZ, bytes.as_ptr(), bytes.len() as u32);
-        RegCloseKey(key);
-        if rc != 0 {
-            return Err(format!("写入自启项失败（{rc}），可能被安全软件拦截"));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
 fn delete_run_value() -> Result<(), String> {
     use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
     use windows_sys::Win32::System::Registry::{
@@ -424,7 +470,11 @@ fn delete_run_value() -> Result<(), String> {
         let name = super::wide(RUN_VALUE);
         let rc = RegDeleteValueW(key, name.as_ptr());
         RegCloseKey(key);
-        if rc == 0 || rc == ERROR_FILE_NOT_FOUND { Ok(()) } else { Err(format!("删除自启项失败（{rc}）")) }
+        if rc == 0 || rc == ERROR_FILE_NOT_FOUND {
+            Ok(())
+        } else {
+            Err(format!("删除自启项失败（{rc}）"))
+        }
     }
 }
 
@@ -462,6 +512,11 @@ mod tests {
             r"C:\Tools\MemCleaner.exe --autostart",
             r"c:\tools\memcleaner.exe"
         ));
+        // 计划任务 XML 里的 Command 不带引号、不含参数。
+        assert!(path_matches(
+            r"C:\Users\admin\AppData\Local\MemCleaner\MemCleaner.exe",
+            r"c:\users\admin\appdata\local\memcleaner\memcleaner.exe"
+        ));
     }
 
     #[test]
@@ -479,7 +534,8 @@ mod tests {
 
     #[test]
     fn xml_tag_extraction_and_unescape() {
-        let xml = r#"<Task><Actions><Exec><Command>C:\a&amp;b\MemCleaner.exe</Command></Exec></Actions></Task>"#;
+        let xml =
+            r#"<Task><Actions><Exec><Command>C:\a&amp;b\MemCleaner.exe</Command></Exec></Actions></Task>"#;
         let cmd = extract_xml_tag(xml, "Command").unwrap();
         assert_eq!(xml_unescape(cmd.trim()), r"C:\a&b\MemCleaner.exe");
         assert!(extract_xml_tag(xml, "Arguments").is_none());
@@ -489,5 +545,17 @@ mod tests {
     fn decode_console_handles_utf8() {
         let s = decode_console("任务".as_bytes());
         assert!(s.contains("任务"));
+    }
+
+    #[test]
+    fn status_helpers_distinguish_task_and_run_modes() {
+        let task = AutostartStatus::InstalledTask;
+        assert!(task.is_installed());
+        assert!(task.is_elevated());
+        let run = AutostartStatus::InstalledRun("x".to_string());
+        assert!(run.is_installed());
+        assert!(!run.is_elevated());
+        assert!(!AutostartStatus::NotInstalled.is_installed());
+        assert!(!AutostartStatus::NotInstalled.is_elevated());
     }
 }

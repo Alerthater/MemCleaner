@@ -3,6 +3,8 @@
 > v1.1.0 的回归结果见 [CHANGELOG.md](../CHANGELOG.md) 与 [VERIFICATION.md](VERIFICATION.md)
 > （`cargo test` 39 项通过 + 管理员权限实测，其中 `--self-test --with-file-cache` 的
 > `TrimFileCache` 步骤返回成功）。
+> v1.2.0 修复自动清理失败风暴与 Low 完整性降权问题；v1.3.0 恢复最高权限计划任务自启、
+> 自动清理降频并修复超时误报，详见 CHANGELOG 与 VERIFICATION 第 9 节（`cargo test` 46 项通过）。
 
 > 说明：本报告是项目开发期间在开发机上的验证记录，文中的绝对路径/进程号为当时的现场数据，复跑时请按你本机路径调整。
 

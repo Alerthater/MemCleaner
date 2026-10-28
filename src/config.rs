@@ -143,6 +143,10 @@ pub struct Config {
     /// 固定间隔自动清理（分钟）；0 表示关闭。
     pub auto_interval_minutes: u32,
     /// 两次自动清理之间的最小冷却时间（秒）。
+    ///
+    /// v1.3.0 起下限为 180 秒：此前的 60 秒冷却会让「使用率长期高于阈值」的机器
+    /// 每分钟清理一次，而每次清理（尤其 FlushModifiedList/收缩文件缓存）都要占用
+    /// 数秒磁盘 IO，反而造成卡顿。自动清理的目标是「缓解压力」，不是「压住数字」。
     pub auto_cooldown_seconds: u32,
 
     // ---------- 清理项（默认等同于 PCL 启动器的三条指令）----------
@@ -197,7 +201,7 @@ impl Default for Config {
             auto_clean_enabled: false,
             auto_threshold_percent: 85,
             auto_interval_minutes: 0,
-            auto_cooldown_seconds: 60,
+            auto_cooldown_seconds: 300,
             clean_working_sets: true,
             clean_modified: true,
             clean_standby: true,
@@ -231,9 +235,9 @@ impl Config {
         if self.auto_interval_minutes > 1440 {
             self.auto_interval_minutes = 0;
         }
-        // 冷却时间：10..=3600 秒，越界回退 60。
-        if !(10..=3600).contains(&self.auto_cooldown_seconds) {
-            self.auto_cooldown_seconds = 60;
+        // 冷却时间：180..=3600 秒（v1.3.0 提高下限，避免过于频繁的清理拖慢系统）。
+        if !(180..=3600).contains(&self.auto_cooldown_seconds) {
+            self.auto_cooldown_seconds = 180;
         }
         // 透明度范围（面板下限 20，避免把界面调到看不见）。
         self.skin_opacity = self.skin_opacity.min(100);
@@ -361,7 +365,8 @@ mod tests {
         cfg.sanitize();
         assert_eq!(cfg.auto_threshold_percent, 100);
         assert_eq!(cfg.auto_interval_minutes, 0);
-        assert_eq!(cfg.auto_cooldown_seconds, 60);
+        // v1.3.0：冷却时间下限提高到 180 秒。
+        assert_eq!(cfg.auto_cooldown_seconds, 180);
         assert_eq!(cfg.last_freed_bytes, 0);
         assert_eq!(cfg.skin_opacity, 100);
         assert_eq!(cfg.panel_opacity, 100);
@@ -376,12 +381,12 @@ mod tests {
         let mut ok = Config::default();
         ok.auto_threshold_percent = 30;
         ok.auto_interval_minutes = 30;
-        ok.auto_cooldown_seconds = 120;
+        ok.auto_cooldown_seconds = 600;
         ok.window_opacity = 100;
         ok.sanitize();
         assert_eq!(ok.auto_threshold_percent, 30);
         assert_eq!(ok.auto_interval_minutes, 30);
-        assert_eq!(ok.auto_cooldown_seconds, 120);
+        assert_eq!(ok.auto_cooldown_seconds, 600);
         assert_eq!(ok.window_opacity, 100);
     }
 
